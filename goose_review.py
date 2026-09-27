@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """LLM review of a pull request with Goose, in three steps.
 
-  review  run every check in .agents/checks/ over the diff, one `goose run`
-          per check, and write the findings as JSON lines;
+  review  run every check in the checks directory (default .agents/checks/)
+          over the diff, one `goose run` per check, and write the findings
+          as JSON lines;
   verify  have a second model re-check each finding against the code and
           keep only the ones it confirms;
   post    publish what is left as one GitHub pull request review.
 
 Why not `goose review`: it runs each check with `--no-profile` and no
 extensions, so the model sees the diff and nothing else -- it cannot open a
-caller, a test or SPECIFICATIONS.md, and a model that tries to anyway ends
+caller, a test or the project's specifications, and a model that tries to anyway ends
 with prose instead of JSON. Here every check gets Goose's `developer`
 extension and the repository checkout. The check files are the same ones
 `goose review` reads, so a local `goose review` still uses them.
 
-Standard library only; needs `git` and `goose` on PATH.
+Standard library only; needs `git` and `goose` on PATH. What a review looks
+for is the caller's: the checks, the facts, the provider templates, the
+excluded paths, extra tool hints and the rules text are all configuration
+(`configure`); nothing here is specific to one repository.
 """
 
 from __future__ import annotations
@@ -35,23 +39,32 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-CHECKS_DIR = Path(".agents/checks")
-# Platform behaviour models got wrong, each fact from a refuted finding;
-# given to the checks and the verifier when the change touches its paths.
-FACTS_DIR = Path(".agents/facts")
+@dataclass
+class Config:
+    """What the caller composes: set once from the command line by
+    `configure`, read by the review and verify steps."""
+    checks_dir: Path = Path(".agents/checks")
+    # Only these checks, by name; empty means every check in checks_dir.
+    only_checks: tuple[str, ...] = ()
+    # Platform behaviour models got wrong, each fact from a refuted finding;
+    # given to the checks and the verifier when the change touches its
+    # paths. A missing directory means no facts.
+    facts_dir: Path = Path(".agents/facts")
+    # Globs never reviewed (build output, lock files, generated files);
+    # review and verify must be given the same list, as both diff.
+    ignore: tuple[str, ...] = ()
+    # Appended to TOOLS: the project's own commands (a toolchain, where the
+    # dependencies' sources are, what not to run).
+    tools_extra: str = ""
+    # Added to every check's and the verifier's prompt; REALISTIC_TRIGGER
+    # unless the caller replaces it.
+    rules: str = ""
 
-# Never reviewed: build output, manual QA notes, tool caches, and files that
-# change mechanically (the same list the Warden profiles ignored).
-IGNORED_PATHSPECS = [
-    ":(exclude,glob)target/**",
-    ":(exclude,glob)docs/manual-qa/**",
-    ":(exclude,glob).codegraph/**",
-    ":(exclude,glob)**/Cargo.lock",
-    ":(exclude,glob)**/CHANGELOG.md",
-]
+
+CONFIG = Config()
 
 # A diff above this many characters is split by file into several batches,
 # so one check never gets more diff than the smallest model's context holds
@@ -146,14 +159,12 @@ SEVERITIES = ["low", "medium", "high", "critical"]
 TOOLS = """\
 ## Tools
 
-You have a shell in the repository checkout (full git history; the Rust
-toolchain is installed). Use it to prove or disprove a finding, not to
-browse. Useful commands:
+You have a shell in the repository checkout, with its full git history. Use
+it to prove or disprove a finding, not to browse. Useful commands:
 
-- Search: `rg -n 'pattern' crates/` (ripgrep), `rg -n -t rust 'fn name'`,
-  `fd name crates/` to find files. For Rust syntax rather than text, use
-  ast-grep: `ast-grep run -l rust -p 'axum::body::to_bytes($$$ARGS)' crates/`
-  or `ast-grep run -l rust -p 'Verb::$V' crates/notedthat-webdav/`.
+- Search: `rg -n 'pattern'` (ripgrep), `rg -n -t <language> 'name'`, and
+  `fd name` to find files. For syntax rather than text, use ast-grep:
+  `ast-grep run -l <language> -p '<pattern with $VAR and $$$ARGS>'`.
 - Read: `sed -n '120,180p' path` or `nl -ba path | sed -n '120,180p'` for a
   line range with numbers; read around a hit before judging it.
 - History ({base} is the commit this change is compared against):
@@ -162,16 +173,16 @@ browse. Useful commands:
   `git log -L :<function>:<path>` (one function's history),
   `git blame -L <start>,<end> <path>`, `git log -S '<text>' --oneline`
   (when a string appeared or vanished), `git grep -n '<text>' {base}`.
-- Rust: `cargo metadata --format-version 1 --no-deps --offline | jq` (the
-  workspace's crates and targets), `cargo tree --offline -i <crate>` (who
-  depends on a crate), and dependency source under
-  `~/.cargo/registry/src/*/<crate>-<version>/` to check what a library call
-  really does (versions are in `Cargo.lock`). Tests live next to the code
-  (`#[cfg(test)]`) and in `crates/*/tests/`; they show the intended contract.
-- Do not build, test or lint (`cargo build`, `check`, `test`, `clippy`): CI
-  runs those, and a build would use up your turns. Do not modify files, and
-  do not use the network.
+- Tests show the intended contract; read the ones next to the changed code.
+- Do not build, test or lint: CI runs those, and a build would use up your
+  turns. Do not modify files, and do not use the network.
 """
+
+
+def tools_prompt(base: str) -> str:
+    """TOOLS for this change, with the project's own hints after it."""
+    extra = CONFIG.tools_extra.strip()
+    return TOOLS.format(base=base) + (f"\n{extra}\n" if extra else "")
 
 OUTPUT_CONTRACT = """\
 ## Output
@@ -185,7 +196,7 @@ Use post-change line numbers from the diff, and report only lines the diff
 adds or changes (lines starting with `+`). No findings: {"findings": []}
 """
 
-# Findings on #207 kept resting on "if the secret held a query string" or
+# Findings on NotedThat#207 kept resting on "if the secret held a query string" or
 # "if someone later set a token for the job": hardening against people who
 # already hold admin rights. Both the checks and the verifier get this.
 REALISTIC_TRIGGER = """\
@@ -208,7 +219,7 @@ You are the second reviewer of an automated pull request review. Another
 model reported the findings below. For each one, open the code in this
 repository checkout and decide whether it is real: the problem exists in the
 changed code, the reasoning holds, and nothing in the code, its callers, the
-tests or SPECIFICATIONS.md already rules it out. Reject a finding that is
+tests or the project's documentation and specifications already rules it out. Reject a finding that is
 speculative, that concerns unchanged code, that rests on a claim you
 cannot confirm from the repository (for example that a dependency, action or
 tool version does not exist -- the repository is newer than any model's
@@ -356,8 +367,43 @@ def glob_regex(glob: str) -> re.Pattern[str]:
 def facts_section(paths: list[str]) -> str:
     """The facts files (same frontmatter as a check) whose `paths` match a
     changed file, for the check and verify prompts."""
-    facts = [f for f in load_checks(FACTS_DIR) if any(f.covers(p) for p in paths)]
+    if not CONFIG.facts_dir.is_dir():
+        return ""
+    facts = [f for f in load_checks(CONFIG.facts_dir) if any(f.covers(p) for p in paths)]
     return "".join(f"## Facts: {f.name}\n\n{f.body}\n\n" for f in facts)
+
+
+def selected_checks() -> list[Check]:
+    """The checks this lane runs: every one in the checks directory, or the
+    ones named. A name that matches no check is an error, not a silent
+    review with less in it."""
+    if not CONFIG.checks_dir.is_dir():
+        raise SystemExit(f"{CONFIG.checks_dir}: no such checks directory")
+    checks = load_checks(CONFIG.checks_dir)
+    if not CONFIG.only_checks:
+        return checks
+    unknown = sorted(set(CONFIG.only_checks) - {c.name for c in checks})
+    if unknown:
+        raise SystemExit(f"no such check in {CONFIG.checks_dir}: {', '.join(unknown)}")
+    return [c for c in checks if c.name in CONFIG.only_checks]
+
+
+def configure(args: argparse.Namespace) -> None:
+    """Set CONFIG from the review and verify steps' shared options."""
+    global CONFIG
+    CONFIG = replace(
+        CONFIG,
+        checks_dir=Path(args.checks_dir),
+        only_checks=tuple(c.strip() for c in args.check or [] if c.strip()),
+        facts_dir=Path(args.facts_dir),
+        ignore=tuple(g.strip() for g in args.ignore or [] if g.strip()),
+        tools_extra=Path(args.tools_file).read_text(encoding="utf-8") if args.tools_file else "",
+        rules=Path(args.rules_file).read_text(encoding="utf-8").strip() + "\n" if args.rules_file else "",
+    )
+
+
+def rules_prompt() -> str:
+    return CONFIG.rules or REALISTIC_TRIGGER
 
 
 def load_checks(directory: Path) -> list[Check]:
@@ -369,7 +415,7 @@ def load_checks(directory: Path) -> list[Check]:
             raise SystemExit(f"{path}: missing YAML frontmatter")
         front, body = match.groups()
         # The frontmatter is flat `key: value`, lists written inline in JSON
-        # syntax (`paths: ["crates/**/*.rs"]`); no YAML parser needed.
+        # syntax (`paths: ["src/**/*.rs"]`); no YAML parser needed.
         meta = dict(
             (k.strip(), v.strip())
             for k, v in (line.split(":", 1) for line in front.splitlines() if ":" in line)
@@ -394,7 +440,8 @@ def git_diff(base: str) -> str:
         # Deleted files are left out: nothing on them can be commented on.
         # Non-ASCII paths stay as they are, not octal-escaped, so they match
         # the paths GitHub reports; Git double-quotes a path only then.
-        ["git", "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "--diff-filter=d", f"{base}...HEAD", "--", ".", *IGNORED_PATHSPECS],
+        ["git", "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "--diff-filter=d", f"{base}...HEAD", "--", ".",
+         *(f":(exclude,glob){glob}" for glob in CONFIG.ignore)],
         check=True,
         capture_output=True,
         text=True,
@@ -452,7 +499,19 @@ def split_diff(diff: str, limit: int = MAX_DIFF_CHARS) -> list[str]:
 
 
 FILE_COMMANDS = {"GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STATE", "GITHUB_STEP_SUMMARY"}
+GOOSE_REVIEW_ENVS = {"GOOSE_REVIEW_PROVIDER_ROUTES", "GOOSE_REVIEW_PROVIDER_ENV", "GOOSE_REVIEW_SECRETS"}
 GITHUB_TOKENS = {"GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+
+
+def goose_env(data: str) -> dict[str, str]:
+    """The Goose process's environment: this one without the Actions
+    runtime, the file-command paths, GitHub tokens and the raw provider
+    settings, plus the provider environment and a private data directory."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ACTIONS_") and k not in FILE_COMMANDS | GITHUB_TOKENS | GOOSE_REVIEW_ENVS}
+    env.update(provider_env())
+    env.update(XDG_DATA_HOME=data, XDG_STATE_HOME=data)
+    return env
 
 
 def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: str,
@@ -500,9 +559,9 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
         # Nor the paths of the step's file commands (GITHUB_ENV, GITHUB_PATH,
         # ...). The model can still find those files; only `post`, on its own
         # runner, is out of its reach, and it scrubs again before publishing.
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("ACTIONS_") and k not in FILE_COMMANDS | GITHUB_TOKENS}
-        env.update(XDG_DATA_HOME=data, XDG_STATE_HOME=data)
+        # The provider settings arrive as a whole; Goose gets only the
+        # environment its providers name.
+        env = goose_env(data)
         command = ["goose", "run", "-n", session, *common(round_turns), "-i", "-"]
         stdin = prompt
         finalising = False
@@ -752,7 +811,8 @@ class FairShare:
 
 
 def cmd_review(args: argparse.Namespace) -> None:
-    checks = load_checks(CHECKS_DIR)
+    configure(args)
+    checks = selected_checks()
     diff = git_diff(args.base)
     out = Path(args.out)
     Path(args.status).unlink(missing_ok=True)
@@ -788,8 +848,8 @@ def cmd_review(args: argparse.Namespace) -> None:
                 f"change is compared against commit {base_sha}: `git show {base_sha}:<path>` "
                 "shows a file as it was before.\n\n"
                 "{time_budget}"  # filled in when the run starts
-                f"{context}{check.body}\n\n{REALISTIC_TRIGGER}\n{facts}"
-                f"{TOOLS.format(base=base_sha)}\n{OUTPUT_CONTRACT}\n## Diff\n\n```diff\n{batch}```\n"
+                f"{context}{check.body}\n\n{rules_prompt()}\n{facts}"
+                f"{tools_prompt(base_sha)}\n{OUTPUT_CONTRACT}\n## Diff\n\n```diff\n{batch}```\n"
             )
             by_check[-1].append((check, f"{check.name}#{i}", prompt))
     # The checks take turns (correctness#0, security#0, correctness#1, ...):
@@ -882,7 +942,7 @@ def merge_overlapping(findings: list[dict]) -> list[dict]:
 
 
 def redact(text: str) -> str:
-    """Remove the proxy's token and routes from anything the model wrote.
+    """Remove the provider secrets (routes, keys) from anything the model wrote.
     The agent has the token in its environment and could read the routes
     from the rendered provider files; a prompt-injected run could copy
     either into a finding -- posted on a public pull request, where GitHub
@@ -895,20 +955,51 @@ def redact(text: str) -> str:
     return text
 
 
-# The proxy's routes, as the workflow passes them to `scrub`: from the
-# secrets themselves, not from the rendered provider files, which the
-# model's shell can rewrite before the scrub runs.
-ROUTE_ENVS = ("GOOSE_THIRDPARTY_BASE_URL", "GOOSE_MINIMAX_BASE_URL")
+# The caller's provider configuration, as the actions pass it (both are
+# secrets): routes as `<template name>=<url>` lines, rendered into the
+# provider templates, and the providers' environment as `NAME=value` lines
+# (API keys, tokens), which only the Goose process gets. Any further value
+# to redact goes in SECRETS_ENV, one per line.
+ROUTES_ENV = "GOOSE_REVIEW_PROVIDER_ROUTES"
+PROVIDER_ENV = "GOOSE_REVIEW_PROVIDER_ENV"
+SECRETS_ENV = "GOOSE_REVIEW_SECRETS"
+
+
+def pairs(text: str) -> dict[str, str]:
+    """`key=value` lines; blank lines skipped, whitespace around the key
+    and the value dropped (a secret pasted with a newline)."""
+    out = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit("a provider setting is not a `name=value` line")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def provider_env() -> dict[str, str]:
+    return pairs(os.environ.get(PROVIDER_ENV, ""))
 
 
 def proxy_secrets() -> list[str]:
-    # The OpenRouter lane's key is in its environment the same way.
-    secrets = [os.environ.get("NOTEDTHAT_PROXY_TOKEN", ""), os.environ.get("OPENROUTER_API_KEY", "")]
-    for name in ROUTE_ENVS:
-        route = "".join(os.environ.get(name, "").split()).rstrip("/")
+    """Every value to redact: the routes (each also as its origin and its
+    host), the provider environment's values, and SECRETS_ENV's lines --
+    from the settings themselves, not from the rendered provider files,
+    which the model's shell can rewrite before the scrub runs."""
+    values = [
+        *pairs(os.environ.get(ROUTES_ENV, "")).values(),
+        *provider_env().values(),
+        *os.environ.get(SECRETS_ENV, "").splitlines(),
+    ]
+    secrets: list[str] = []
+    for value in (v.strip() for v in values):
+        route = "".join(value.split()).rstrip("/")
         origin = re.match(r"https?://([^/]+)", route)
-        # The route, its origin, and the host alone (as a log or curl names it).
-        secrets += [route, *(origin.group(0, 1) if origin else ())]
+        # A route also as its origin and its host alone (as a log or curl
+        # names it); any other value as it is.
+        secrets += [route, *origin.group(0, 1)] if origin else [value]
     secrets = [s for s in secrets if len(s) >= 8]
     encoded = [e for s in secrets for e in encodings(s)]
     # Longest first, so a route is replaced before the origin inside it.
@@ -970,6 +1061,7 @@ FINDING_KEYS = {"path", "line_start", "line_end", "severity", "check", "summary"
 
 
 def write_status(path: str, **fields: object) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps({**read_status(path), **fields}, indent=2))
 
 
@@ -1042,7 +1134,57 @@ def confirm(finding: dict, verdict: dict) -> dict | None:
     return confirmed
 
 
+def goose_providers_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config", "goose", "custom_providers")
+
+
+def models_url(provider: dict) -> str:
+    """The provider's `models` endpoint, beside its chat completions path."""
+    path = provider.get("base_path", "").strip("/").removesuffix("chat/completions").strip("/")
+    return "/".join(p for p in (provider.get("base_url", "").rstrip("/"), path, "models") if p)
+
+
+def cmd_preflight(args: argparse.Namespace) -> None:
+    """Ask each provider the lane uses for its models before any model runs,
+    so an unreachable provider or a rejected key is reported as such rather
+    than as checks that did not finish. Prints the provider's name and the
+    HTTP status only, never its URL: a route is a secret."""
+    env = provider_env()
+    for name in dict.fromkeys(p for p in args.provider if p):
+        path = goose_providers_dir() / f"{name}.json"
+        try:
+            provider = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            why = f"the {name} provider is not configured (no {name}.json in the providers directory)"
+        else:
+            headers = {"Accept": "application/json"}
+            key_env = provider.get("api_key_env")
+            if provider.get("requires_auth", True) and key_env:
+                if not env.get(key_env):
+                    why = f"the {name} provider's key {key_env} is not in provider-env"
+                    write_status(args.status, error=why)
+                    raise SystemExit(f"::error::{why}")
+                headers["Authorization"] = f"Bearer {env[key_env]}"
+            request = urllib.request.Request(models_url(provider), headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    code = response.status
+            except urllib.error.HTTPError as error:
+                code = error.code
+                error.close()
+            except (urllib.error.URLError, TimeoutError, OSError) as error:
+                code = None
+                reason = "did not answer within 30 s" if "timed out" in str(error).lower() else "could not be reached"
+            print(f"{name}: GET <provider>/models -> {code or 'no answer'}")
+            if code is not None and code < 400:
+                continue
+            why = f"the {name} provider {reason if code is None else f'answered HTTP {code}'}"
+        write_status(args.status, error=why)
+        raise SystemExit(f"::error::{why}")
+
+
 def cmd_verify(args: argparse.Namespace) -> None:
+    configure(args)
     findings = read_findings(args.input)
     out = Path(args.out)
     if not findings:
@@ -1107,7 +1249,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
             for i, f in enumerate(batch)
         )
         rest = (
-            f"{VERIFY_PROMPT}\n{REALISTIC_TRIGGER}\n{facts}{TOOLS.format(base=base_sha)}\n"
+            f"{VERIFY_PROMPT}\n{rules_prompt()}\n{facts}{tools_prompt(base_sha)}\n"
             f"{pr_context(args.context)}{answered_section(answered, {f['path'] for f in batch})}## Findings\n\n{listing}\n\n"
             f"## Diff of the files these findings are on\n\n```diff\n{batch_diff(batch)}```\n"
         )
@@ -1196,7 +1338,7 @@ def github(method: str, url: str, token: str, body: dict | None = None,
     """A GitHub API call: its status and its JSON body, or, for another
     `accept` (a diff), its text."""
     if not url.startswith("https://"):
-        url = "https://api.github.com" + url
+        url = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/") + url
     request = urllib.request.Request(
         url,
         method=method,
@@ -2003,6 +2145,14 @@ HISTORY_RUNS = 20
 LEGACY_HISTORY_RE = re.compile(r"<!-- goose-review:history ([A-Za-z0-9+/=]*) -->")
 
 
+def job_lane(name: str) -> tuple[str, str]:
+    """(lane, kind) from a lane job's name: its last two ` / ` parts, so both
+    `deepseek / review` (a caller's own lane workflow) and `review / lanes /
+    deepseek / review` (nested in the reusable workflow) match."""
+    parts = name.split(" / ")
+    return (parts[-2], parts[-1]) if len(parts) >= 2 else ("", "")
+
+
 def cmd_summary(args: argparse.Namespace) -> None:
     """One comment for the pull request: this run's lanes in a table (models,
     when it ran and for how long, checks, findings found and posted, the
@@ -2030,7 +2180,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
                       if args.state == "finished" else (0, None))
         if code == 200 and isinstance(data, dict):
             for job in data.get("jobs", []):
-                lane, _, kind = job.get("name", "").partition(" / ")
+                lane, kind = job_lane(job.get("name", ""))
                 if kind in ("review", "post"):
                     jobs.setdefault(lane, {})[kind] = job
         everything = paged(comments, token)
@@ -2052,7 +2202,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
     this = next((r for r in earlier if r.get("run") == str(args.run_id)), {})
     run = {
         "run": str(args.run_id), "sha": args.head_sha[:7],
-        "url": f"https://github.com/{args.repo}/actions/runs/{args.run_id}",
+        "url": f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com').rstrip('/')}/{args.repo}/actions/runs/{args.run_id}",
         # Without a running entry (its step failed or never ran), the run
         # started when its first lane did.
         "state": args.state,
@@ -2256,6 +2406,13 @@ def main() -> None:
     verify.add_argument("--in", dest="input", default="findings.jsonl")
     verify.add_argument("--out", default="verified.jsonl")
     verify.add_argument("--status", default="review-status.json")
+    for p in (review, verify):
+        p.add_argument("--checks-dir", default=".agents/checks", help="directory of the check files")
+        p.add_argument("--check", action="append", help="run only this check (by name); repeatable")
+        p.add_argument("--facts-dir", default=".agents/facts", help="directory of the facts files; missing means none")
+        p.add_argument("--ignore", action="append", help="glob never reviewed; repeatable, and the same for review and verify")
+        p.add_argument("--tools-file", help="appended to the tools prompt: the project's own commands")
+        p.add_argument("--rules-file", help="replaces the rules added to every check's and the verifier's prompt")
     verify.set_defaults(func=cmd_verify)
 
     ans = sub.add_parser("answered", help="write the pull request's answered lane findings, for `verify`")
@@ -2297,7 +2454,12 @@ def main() -> None:
     tidy.add_argument("--dry-run", action="store_true", help="count what would be collapsed")
     tidy.set_defaults(func=cmd_tidy)
 
-    scrub = sub.add_parser("scrub", help="redact the proxy secrets from every file under the directories, in place")
+    pre = sub.add_parser("preflight", help="check that each provider answers, before any model runs")
+    pre.add_argument("--provider", action="append", default=[], help="a provider the lane uses; repeatable")
+    pre.add_argument("--status", default="review-status.json", help="where a failure is recorded, for `post`")
+    pre.set_defaults(func=cmd_preflight)
+
+    scrub = sub.add_parser("scrub", help=f"redact the secrets in ${SECRETS_ENV} from every file under the directories, in place")
     scrub.add_argument("dirs", nargs="+")
     scrub.set_defaults(func=cmd_scrub)
 
