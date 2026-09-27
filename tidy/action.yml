@@ -1,0 +1,27 @@
+name: Goose review - tidy
+description: >-
+  The first step of a review run: collapses the review's own resolved
+  threads as outdated (only its own comments; a lane review once all its
+  threads are resolved), and marks the run as running in the pull
+  request's summary comment. Runs no model.
+author: Stephan Meijer
+
+inputs:
+  github-token:
+    description: Needs pull-requests write and issues write.
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Collapse resolved threads; mark this run running
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        RUN_ID: ${{ github.run_id }}
+      run: >
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" tidy
+        --repo "$REPO" --pr "$PR" --head-sha "$HEAD_SHA" --run-id "$RUN_ID"

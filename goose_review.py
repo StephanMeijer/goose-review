@@ -1020,6 +1020,14 @@ def encodings(secret: str) -> list[str]:
     return forms
 
 
+def cmd_mask(args: argparse.Namespace) -> None:
+    """Have the runner mask every value `redact` removes in the job's log
+    too: GitHub masks a secret only as a whole, not a line of a multiline
+    one, nor a route's host or an encoded form."""
+    for secret in proxy_secrets():
+        print(f"::add-mask::{secret}")
+
+
 def cmd_scrub(args: argparse.Namespace) -> None:
     """Redact every file under the given directories in place, whoever
     wrote it: the model's shell can write there too, and they are uploaded
@@ -2453,6 +2461,9 @@ def main() -> None:
     tidy.add_argument("--run-id", required=True, help="this workflow run, marked running in the summary")
     tidy.add_argument("--dry-run", action="store_true", help="count what would be collapsed")
     tidy.set_defaults(func=cmd_tidy)
+
+    mask = sub.add_parser("mask", help="mask every secret the provider settings imply in the job's log")
+    mask.set_defaults(func=cmd_mask)
 
     pre = sub.add_parser("preflight", help="check that each provider answers, before any model runs")
     pre.add_argument("--provider", action="append", default=[], help="a provider the lane uses; repeatable")

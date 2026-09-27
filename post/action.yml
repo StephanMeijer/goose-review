@@ -1,0 +1,84 @@
+name: Goose review - post
+description: >-
+  Publishes one lane's verified findings on the pull request, in a job of
+  its own that runs no model. The review job's artifact is scrubbed again
+  here first: once the model had a shell in the review job, nothing later
+  in that job can be trusted, and this job runs on a fresh runner with the
+  action's own copy of the script.
+author: Stephan Meijer
+
+inputs:
+  lane:
+    description: The lane's name, as given to the review action.
+    required: true
+  model:
+    description: The reviewing model, for the signature.
+    required: true
+  verify-model:
+    description: The verifying model, for the signature.
+    required: true
+  provider-routes:
+    description: Secret. The same value as the review action's; only redacted here.
+    default: ""
+  provider-env:
+    description: Secret. The same value as the review action's; only redacted here.
+    default: ""
+  github-token:
+    description: Posts the review and replies; needs pull-requests write.
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Mask the provider settings
+      shell: bash
+      env:
+        GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
+        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+      run: python3 "$GITHUB_ACTION_PATH/../goose_review.py" mask
+
+    # Missing when the review job failed before uploading; posted as "the
+    # review did not run".
+    - name: Fetch the review
+      continue-on-error: true
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: goose-review-${{ inputs.lane }}
+        path: ${{ runner.temp }}/artifact
+
+    - name: Scrub the findings again
+      shell: bash
+      env:
+        GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
+        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+      run: python3 "$GITHUB_ACTION_PATH/../goose_review.py" scrub "$RUNNER_TEMP/artifact"
+
+    - name: Post the review
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        LANE: ${{ inputs.lane }}
+        MODEL: ${{ inputs.model }}
+        VERIFY_MODEL: ${{ inputs.verify-model }}
+      run: >
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" post
+        --repo "$REPO" --pr "$PR" --head-sha "$HEAD_SHA" --base-sha "$BASE_SHA"
+        --lane "$LANE" --model "$MODEL" --verify-model "$VERIFY_MODEL"
+        --in "$RUNNER_TEMP/artifact/review/verified.jsonl"
+        --status "$RUNNER_TEMP/artifact/review/status.json"
+        --result "$RUNNER_TEMP/result/$LANE.json"
+
+    # How this lane went, for the run's summary comment; written even when
+    # posting failed.
+    - name: Keep the lane's result
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: goose-result-${{ inputs.lane }}
+        path: ${{ runner.temp }}/result/
+        if-no-files-found: ignore
+        retention-days: 14

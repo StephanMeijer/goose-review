@@ -1,0 +1,276 @@
+name: Goose review - review
+description: >-
+  One lane's review: the caller's checks run with one model, a model of
+  another family verifies every finding, and the result is scrubbed and
+  uploaded for the `post` action. Runs in a job with a read-only token and
+  its network blocked but for what it needs (the caller's harden-runner step
+  comes first). The model gets a shell in the checkout; nothing later in
+  this job is trusted, which is why `post` runs in another job.
+author: Stephan Meijer
+
+inputs:
+  lane:
+    description: The lane's name, [a-z0-9-]+. Names its artifact and its review on the pull request.
+    required: true
+  provider:
+    description: The reviewing model's Goose provider (a template in providers-dir).
+    required: true
+  model:
+    description: The reviewing model.
+    required: true
+  verify-provider:
+    description: The verifying model's provider. Use another model family than the reviewer's.
+    required: true
+  verify-model:
+    description: The verifying model.
+    required: true
+  verify-backup-provider:
+    description: Verifies instead when verify-provider answers empty or gives no verdicts. Optional.
+    default: ""
+  verify-backup-model:
+    description: The backup verifier's model.
+    default: ""
+  checks:
+    description: Only these checks, by name, one per line. Empty runs every check in checks-dir.
+    default: ""
+  checks-dir:
+    description: Directory of the check files.
+    default: .agents/checks
+  facts-dir:
+    description: Directory of the facts files. A missing directory means no facts.
+    default: .agents/facts
+  providers-dir:
+    description: Directory of the Goose provider templates (*.json).
+    default: .github/goose/providers
+  ignore:
+    description: Globs never reviewed, one per line (build output, lock files, generated code).
+    default: ""
+  tools-file:
+    description: A file appended to the tools prompt, with the project's own commands. Optional.
+    default: ""
+  rules-file:
+    description: A file whose text replaces the built-in "Only failures that can happen" rules. Optional.
+    default: ""
+  jobs:
+    description: Checks run at once.
+    default: "2"
+  budget-minutes:
+    description: Wall-clock budget for all checks.
+    default: "35"
+  verify-budget-minutes:
+    description: Wall-clock budget for verification.
+    default: "12"
+  provider-routes:
+    description: >-
+      Secret. Lines `<template name>=<url>`: each renders that template for
+      the route (origin into base_url, path into base_path). Templates
+      without a route are used as written.
+    default: ""
+  provider-env:
+    description: >-
+      Secret. Lines `NAME=value` (API keys, tokens) that only the Goose
+      process gets; a template's `api_key_env` names one.
+    default: ""
+  github-token:
+    description: Reads the pull request's answered findings; needs pull-requests read. Never reaches the model.
+    default: ${{ github.token }}
+  install-goose:
+    description: Install Goose. `false` expects a `goose` on PATH (CI uses a fake one).
+    default: "true"
+  goose-version:
+    description: The Goose release to install.
+    default: v1.52.0
+  goose-sha256:
+    description: The sha256 of goose-x86_64-unknown-linux-gnu.tar.gz for goose-version.
+    default: 4aee1f770b405c44194c0e9407df1fb06bda4c50eee935f0d8fd10731821cc5e
+  install-tools:
+    description: Install ripgrep, fd and ast-grep (pinned by sha256), which the tools prompt names.
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare
+      shell: bash
+      env:
+        LANE: ${{ inputs.lane }}
+        GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
+        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+      run: |
+        if ! [[ $LANE =~ ^[a-z0-9-]+$ ]] || [ "$LANE" = summary ]; then
+          echo "::error::lane must be [a-z0-9-]+ and not 'summary'" >&2
+          exit 1
+        fi
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" mask
+        mkdir -p "$RUNNER_TEMP/review" "$RUNNER_TEMP/bin"
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+        {
+          # Config (with the providers) and transcripts live outside the
+          # checkout the agent works in.
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/goose-config"
+          echo "GOOSE_REVIEW_LOG_DIR=$RUNNER_TEMP/goose-logs"
+          # No keyring on a runner; keys come from provider-env.
+          echo "GOOSE_DISABLE_KEYRING=1"
+          # Goose reports usage unless told not to.
+          echo "GOOSE_TELEMETRY_OFF=1"
+          echo "GOOSE_TELEMETRY_ENABLED=false"
+        } >> "$GITHUB_ENV"
+
+    - name: Install Goose ${{ inputs.goose-version }}
+      if: inputs.install-goose == 'true'
+      shell: bash
+      env:
+        GOOSE_VERSION: ${{ inputs.goose-version }}
+        GOOSE_SHA256: ${{ inputs.goose-sha256 }}
+      run: |
+        cd "$RUNNER_TEMP"
+        curl -sSfL -o goose.tar.gz \
+          "https://github.com/block/goose/releases/download/$GOOSE_VERSION/goose-x86_64-unknown-linux-gnu.tar.gz"
+        echo "$GOOSE_SHA256  goose.tar.gz" | sha256sum -c -
+        tar xzf goose.tar.gz -C bin ./goose
+        bin/goose --version
+
+    # What the tools prompt tells the model it can use. From release
+    # archives pinned by sha256, not apt, whose mirrors an egress policy
+    # would have to allow. git and jq come with the runner.
+    - name: Install the reviewer's tools
+      if: inputs.install-tools == 'true'
+      shell: bash
+      env:
+        RG_VERSION: 15.2.0
+        RG_SHA256: 33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+        FD_VERSION: v10.5.0
+        FD_SHA256: 761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7
+        AST_GREP_VERSION: 0.45.3
+        AST_GREP_SHA256: f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8
+      run: |
+        cd "$RUNNER_TEMP"
+        fetch() { curl -sSfL -o "$1" "$2" && echo "$3  $1" | sha256sum -c -; }
+        rg="ripgrep-$RG_VERSION-x86_64-unknown-linux-musl"
+        fetch rg.tar.gz "https://github.com/BurntSushi/ripgrep/releases/download/$RG_VERSION/$rg.tar.gz" "$RG_SHA256"
+        tar xzf rg.tar.gz -C bin --strip-components=1 "$rg/rg"
+        fd="fd-$FD_VERSION-x86_64-unknown-linux-musl"
+        fetch fd.tar.gz "https://github.com/sharkdp/fd/releases/download/$FD_VERSION/$fd.tar.gz" "$FD_SHA256"
+        tar xzf fd.tar.gz -C bin --strip-components=1 "$fd/fd"
+        fetch ast-grep.zip "https://github.com/ast-grep/ast-grep/releases/download/$AST_GREP_VERSION/app-x86_64-unknown-linux-gnu.zip" "$AST_GREP_SHA256"
+        unzip -q -o ast-grep.zip ast-grep -d bin
+        bin/rg --version | head -1; bin/fd --version; bin/ast-grep --version
+
+    - name: Configure the Goose providers
+      shell: bash
+      env:
+        PROVIDERS_DIR: ${{ inputs.providers-dir }}
+        GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
+      run: |
+        if ! "$GITHUB_ACTION_PATH/../setup-providers.sh" "$PROVIDERS_DIR" "$XDG_CONFIG_HOME/goose/custom_providers"; then
+          jq -n '{error: "the provider settings are invalid (see the review job log)"}' > "$RUNNER_TEMP/review/status.json"
+          exit 1
+        fi
+
+    - name: Preflight the providers
+      shell: bash
+      env:
+        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+        PROVIDER: ${{ inputs.provider }}
+        VERIFY_PROVIDER: ${{ inputs.verify-provider }}
+        BACKUP_PROVIDER: ${{ inputs.verify-backup-provider }}
+      run: >
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" preflight
+        --provider "$PROVIDER" --provider "$VERIFY_PROVIDER" --provider "$BACKUP_PROVIDER"
+        --status "$RUNNER_TEMP/review/status.json"
+
+    # Title and body go through the environment into a file: PR text is
+    # never interpolated into a script, and the prompts mark it as data.
+    - name: Collect the pull request description
+      shell: bash
+      env:
+        TITLE: ${{ github.event.pull_request.title }}
+        BODY: ${{ github.event.pull_request.body }}
+      run: printf '# %s\n\n%s\n' "$TITLE" "$BODY" > "$RUNNER_TEMP/pr.md"
+
+    # Findings on this pull request that someone already answered, so the
+    # verifier rejects a repeat. Before any model runs, and the only step
+    # with the token. Without the file, verification goes without it.
+    - name: Collect the answered findings
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+      run: >
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" answered
+        --repo "$REPO" --pr "$PR" --out "$RUNNER_TEMP/answered.json"
+        || echo "::warning::could not collect the answered findings; verifying without them"
+
+    - name: Review (${{ inputs.model }})
+      shell: bash
+      env:
+        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+        BASE: ${{ github.event.pull_request.base.sha }}
+        PROVIDER: ${{ inputs.provider }}
+        MODEL: ${{ inputs.model }}
+        JOBS: ${{ inputs.jobs }}
+        BUDGET: ${{ inputs.budget-minutes }}
+        CHECKS: ${{ inputs.checks }}
+        CHECKS_DIR: ${{ inputs.checks-dir }}
+        FACTS_DIR: ${{ inputs.facts-dir }}
+        IGNORE: ${{ inputs.ignore }}
+        TOOLS_FILE: ${{ inputs.tools-file }}
+        RULES_FILE: ${{ inputs.rules-file }}
+      run: |
+        source "$GITHUB_ACTION_PATH/../options.sh"
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" review \
+          --base "$BASE" --provider "$PROVIDER" --model "$MODEL" \
+          --jobs "$JOBS" --budget-minutes "$BUDGET" --context "$RUNNER_TEMP/pr.md" \
+          "${options[@]}" "${checks[@]}" \
+          --out "$RUNNER_TEMP/review/findings.jsonl" --status "$RUNNER_TEMP/review/status.json"
+
+    - name: Verify (${{ inputs.verify-model }})
+      shell: bash
+      env:
+        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+        BASE: ${{ github.event.pull_request.base.sha }}
+        PROVIDER: ${{ inputs.verify-provider }}
+        MODEL: ${{ inputs.verify-model }}
+        BACKUP_PROVIDER: ${{ inputs.verify-backup-provider }}
+        BACKUP_MODEL: ${{ inputs.verify-backup-model }}
+        BUDGET: ${{ inputs.verify-budget-minutes }}
+        CHECKS: ""
+        CHECKS_DIR: ${{ inputs.checks-dir }}
+        FACTS_DIR: ${{ inputs.facts-dir }}
+        IGNORE: ${{ inputs.ignore }}
+        TOOLS_FILE: ${{ inputs.tools-file }}
+        RULES_FILE: ${{ inputs.rules-file }}
+      run: |
+        source "$GITHUB_ACTION_PATH/../options.sh"
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" verify \
+          --base "$BASE" --provider "$PROVIDER" --model "$MODEL" \
+          --backup-provider "$BACKUP_PROVIDER" --backup-model "$BACKUP_MODEL" \
+          --budget-minutes "$BUDGET" --context "$RUNNER_TEMP/pr.md" --answered "$RUNNER_TEMP/answered.json" \
+          "${options[@]}" \
+          --in "$RUNNER_TEMP/review/findings.jsonl" --out "$RUNNER_TEMP/review/verified.jsonl" \
+          --status "$RUNNER_TEMP/review/status.json"
+
+    # The model could write to these directories through its shell, so
+    # everything uploaded is scrubbed first, not only what the script wrote.
+    # `post` scrubs again on its own runner: this job is not trusted.
+    - name: Scrub the findings and transcripts
+      if: always()
+      shell: bash
+      env:
+        GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
+        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+      run: python3 "$GITHUB_ACTION_PATH/../goose_review.py" scrub "$RUNNER_TEMP/review" "$RUNNER_TEMP/goose-logs"
+
+    - name: Keep the findings and transcripts
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: goose-review-${{ inputs.lane }}
+        path: |
+          ${{ runner.temp }}/review/findings.jsonl
+          ${{ runner.temp }}/review/verified.jsonl
+          ${{ runner.temp }}/review/status.json
+          ${{ runner.temp }}/goose-logs/*.log
+        if-no-files-found: ignore
+        retention-days: 14
