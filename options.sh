@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 # Sourced by the review action's review and verify steps: turns the
 # caller's settings (in the environment, never interpolated into a script)
-# into goose_review.py options. One value per line for CHECKS and IGNORE;
-# blank lines and surrounding whitespace are dropped.
+# into goose_review.py options. One glob per line for IGNORE (blank lines
+# and surrounding whitespace dropped); CHECKS as described below.
 #
 # Sets `options` (shared by review and verify) and `checks` (review only).
 
@@ -21,5 +21,9 @@ while IFS= read -r glob; do options+=(--ignore "$glob"); done < <(lines "${IGNOR
 if [ -n "${TOOLS_FILE:-}" ]; then options+=(--tools-file "$TOOLS_FILE"); fi
 if [ -n "${RULES_FILE:-}" ]; then options+=(--rules-file "$RULES_FILE"); fi
 
+# Check names are file names: split on whitespace and commas, so a lane's
+# list can arrive one per line or joined on one line (a workflow matrix
+# cannot join with a newline).
 checks=()
-while IFS= read -r name; do checks+=(--check "$name"); done < <(lines "${CHECKS:-}")
+read -r -a names <<<"$(tr ',\n\r' '   ' <<<"${CHECKS:-}")"
+for name in "${names[@]}"; do checks+=(--check "$name"); done

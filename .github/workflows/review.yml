@@ -1,0 +1,182 @@
+# The pre-composed Goose review: tidy, one lane per model pair, then the
+# summary. A repository calls it from its own workflow (see
+# examples/caller.yml), which keeps the trigger, the gate (no forks, drafts
+# or release PRs) and the concurrency group:
+#
+#   jobs:
+#     goose-review:
+#       uses: StephanMeijer/goose-review/.github/workflows/review.yml@<sha>
+#       with:
+#         lanes: '[{"lane": "a", "provider": ..., "model": ..., "verify-provider": ..., "verify-model": ...}]'
+#       secrets:
+#         PROVIDER_ROUTES: ${{ secrets.MY_ROUTES }}
+#         PROVIDER_ENV: ${{ secrets.MY_PROVIDER_ENV }}
+#
+# What the review looks for is the caller's: its checks, facts and provider
+# templates, in the directories named below. The actions this workflow uses
+# are pinned to the commit holding their code (scripts/pin.sh), so pinning
+# this file pins everything it runs.
+name: Goose review
+
+on:
+  workflow_call:
+    inputs:
+      lanes:
+        description: >-
+          JSON list of lanes: {lane, provider, model, verify-provider,
+          verify-model, verify-backup-provider?, verify-backup-model?,
+          checks? (list of check names), jobs? (checks at once, default 2)}.
+        type: string
+        required: true
+      checks-dir:
+        type: string
+        default: .agents/checks
+      facts-dir:
+        type: string
+        default: .agents/facts
+      providers-dir:
+        type: string
+        default: .github/goose/providers
+      ignore:
+        description: Globs never reviewed, one per line.
+        type: string
+        default: ""
+      tools-file:
+        description: A file appended to the tools prompt.
+        type: string
+        default: ""
+      rules-file:
+        description: A file replacing the built-in rules.
+        type: string
+        default: ""
+      budget-minutes:
+        type: number
+        default: 35
+      verify-budget-minutes:
+        type: number
+        default: 12
+      egress-endpoints:
+        description: >-
+          Further host:port entries the review job may reach, one per line:
+          the providers' hosts (or your egress proxy's), and whatever
+          `setup` downloads from.
+        type: string
+        default: ""
+      setup:
+        description: >-
+          Shell commands run in the review job after the checkout, before any
+          secret or model: the project's own preparation (e.g. `cargo fetch
+          --locked`, so the model can read dependency sources).
+        type: string
+        default: ""
+      runs-on:
+        type: string
+        default: ubuntu-latest
+      review-timeout-minutes:
+        type: number
+        default: 60
+    secrets:
+      PROVIDER_ROUTES:
+        description: Lines `<template name>=<url>`; see the review action.
+        required: false
+      PROVIDER_ENV:
+        description: Lines `NAME=value` that only the Goose process gets; see the review action.
+        required: false
+
+permissions: {}
+
+jobs:
+  # First, in seconds: collapse the review's own resolved threads, and mark
+  # this run as running in the summary comment.
+  tidy:
+    name: tidy
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+      - uses: StephanMeijer/goose-review/tidy@0000000000000000000000000000000000000000
+
+  lanes:
+    name: ${{ matrix.lane }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.lanes) }}
+    uses: ./.github/workflows/lane.yml
+    with:
+      lane: ${{ matrix.lane }}
+      provider: ${{ matrix.provider }}
+      model: ${{ matrix.model }}
+      verify-provider: ${{ matrix['verify-provider'] }}
+      verify-model: ${{ matrix['verify-model'] }}
+      verify-backup-provider: ${{ matrix['verify-backup-provider'] || '' }}
+      verify-backup-model: ${{ matrix['verify-backup-model'] || '' }}
+      checks: ${{ matrix.checks && join(matrix.checks, ' ') || '' }}
+      jobs: ${{ matrix.jobs || 2 }}
+      checks-dir: ${{ inputs.checks-dir }}
+      facts-dir: ${{ inputs.facts-dir }}
+      providers-dir: ${{ inputs.providers-dir }}
+      ignore: ${{ inputs.ignore }}
+      tools-file: ${{ inputs.tools-file }}
+      rules-file: ${{ inputs.rules-file }}
+      budget-minutes: ${{ inputs.budget-minutes }}
+      verify-budget-minutes: ${{ inputs.verify-budget-minutes }}
+      egress-endpoints: ${{ inputs.egress-endpoints }}
+      setup: ${{ inputs.setup }}
+      runs-on: ${{ inputs.runs-on }}
+      review-timeout-minutes: ${{ inputs.review-timeout-minutes }}
+    secrets:
+      PROVIDER_ROUTES: ${{ secrets.PROVIDER_ROUTES }}
+      PROVIDER_ENV: ${{ secrets.PROVIDER_ENV }}
+
+  # Last: one comment for the pull request, after tidy (whose "running"
+  # entry it replaces) and every lane.
+  summary:
+    name: summary
+    needs: [tidy, lanes]
+    if: ${{ !cancelled() && needs.lanes.result != 'skipped' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            results-receiver.actions.githubusercontent.com:443
+            productionresultssa0.blob.core.windows.net:443
+            productionresultssa1.blob.core.windows.net:443
+            productionresultssa2.blob.core.windows.net:443
+            productionresultssa3.blob.core.windows.net:443
+            productionresultssa4.blob.core.windows.net:443
+            productionresultssa5.blob.core.windows.net:443
+            productionresultssa6.blob.core.windows.net:443
+            productionresultssa7.blob.core.windows.net:443
+            productionresultssa8.blob.core.windows.net:443
+            productionresultssa9.blob.core.windows.net:443
+            productionresultssa10.blob.core.windows.net:443
+            productionresultssa11.blob.core.windows.net:443
+            productionresultssa12.blob.core.windows.net:443
+            productionresultssa13.blob.core.windows.net:443
+            productionresultssa14.blob.core.windows.net:443
+            productionresultssa15.blob.core.windows.net:443
+            productionresultssa16.blob.core.windows.net:443
+            productionresultssa17.blob.core.windows.net:443
+            productionresultssa18.blob.core.windows.net:443
+            productionresultssa19.blob.core.windows.net:443
+      - uses: StephanMeijer/goose-review/summary@0000000000000000000000000000000000000000
