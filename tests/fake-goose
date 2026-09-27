@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""A stand-in for `goose run --output-format json`, for the end-to-end test.
+
+It answers the way the engine reads Goose: a JSON document with the run's
+`metadata.status` and the assistant's messages.
+
+- A review prompt (it has a `## Diff`) gets one finding on every added line
+  that contains GOOSE-REVIEW-E2E, severity medium.
+- A verify prompt (it has `## Findings`) gets every finding kept, with the
+  line it names quoted from the checkout as evidence.
+- A model named in FAKE_GOOSE_EMPTY_MODELS (space-separated) answers every
+  turn empty with no tokens, like a provider past its usage limit, so the
+  backup verifier takes over.
+- A model named in FAKE_GOOSE_SLOW_MODELS (space-separated) takes
+  FAKE_GOOSE_SLOW_SECONDS (default 90) before answering a review, so its
+  lane posts after the others and replies in their open thread.
+- `goose --version` prints a version.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+MARK = "GOOSE-REVIEW-E2E"
+
+
+def answer(text: str, tokens: int = 1000) -> None:
+    print(json.dumps({
+        "messages": [{"role": "assistant", "content": [{"type": "text", "text": text}] if text else []}],
+        "metadata": {"status": "completed", "total_tokens": tokens},
+    }))
+
+
+def review(prompt: str) -> str:
+    diff = prompt.split("## Diff", 1)[1]
+    findings, path, line = [], None, 0
+    for row in diff.splitlines():
+        if row.startswith("+++ b/"):
+            path = row[6:].strip()
+        elif m := re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", row):
+            line = int(m.group(1))
+        elif row.startswith("+") and not row.startswith("+++"):
+            if MARK in row and path:
+                findings.append({
+                    "severity": "medium", "path": path, "line_start": line, "line_end": line,
+                    "summary": f"The line carries the {MARK} marker, which the end-to-end test plants. Remove it.",
+                })
+            line += 1
+        elif not row.startswith("-"):
+            line += 1
+    return json.dumps({"findings": findings})
+
+
+def verify(prompt: str) -> str:
+    listing = prompt.split("## Findings", 1)[1]
+    verdicts = []
+    for m in re.finditer(r"^(\d+)\. \[(\w+)\] (\S+):(\d+)-(\d+)", listing, re.M):
+        index, severity, path, start = int(m.group(1)), m.group(2), m.group(3), int(m.group(4))
+        try:
+            quote = Path(path).read_text(encoding="utf-8").splitlines()[start - 1].strip()
+        except (OSError, IndexError):
+            verdicts.append({"index": index, "keep": False, "reason": "the line is not there"})
+            continue
+        verdicts.append({
+            "index": index, "keep": True, "severity": severity, "trigger": "the end-to-end test's planted line",
+            "evidence": {"path": path, "line": start, "quote": quote},
+            "reason": "The marker is on the line.",
+        })
+    return json.dumps({"verdicts": verdicts})
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if args[:1] == ["--version"]:
+        print("fake-goose 0.0.0")
+        return
+    model = args[args.index("--model") + 1] if "--model" in args else ""
+    prompt = sys.stdin.read()
+    if model in os.environ.get("FAKE_GOOSE_EMPTY_MODELS", "").split():
+        answer("", tokens=0)
+        return
+    # A resumed session (a second look, a request for the JSON) gets the
+    # answer its first prompt got.
+    state = Path(os.environ.get("XDG_DATA_HOME", "/tmp"), "fake-goose")
+    state.mkdir(parents=True, exist_ok=True)
+    session = state / (args[args.index("-n") + 1] if "-n" in args else "default")
+    if "--resume" in args and session.exists():
+        answer(session.read_text(encoding="utf-8"))
+        return
+    if "## Diff" in prompt and model in os.environ.get("FAKE_GOOSE_SLOW_MODELS", "").split():
+        time.sleep(float(os.environ.get("FAKE_GOOSE_SLOW_SECONDS", "90")))
+    text = verify(prompt) if "## Findings" in prompt else review(prompt) if "## Diff" in prompt else ""
+    session.write_text(text, encoding="utf-8")
+    answer(text)
+
+
+if __name__ == "__main__":
+    main()

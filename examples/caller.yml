@@ -1,0 +1,58 @@
+# .github/workflows/goose-review.yml in your repository: the Goose review
+# on every pull request, with your checks (.agents/checks/), facts
+# (.agents/facts/) and provider templates (.github/goose/providers/).
+name: Goose review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# A push never cancels a review in progress: it finishes and posts, and the
+# newest push is reviewed after it (pushes in between are skipped; every
+# run reviews the whole diff).
+concurrency:
+  group: goose-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  goose-review:
+    # Fork PRs get no secrets; drafts wait until they are ready. Add your
+    # release branches here.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && !github.event.pull_request.draft
+    uses: StephanMeijer/goose-review/.github/workflows/review.yml@0000000000000000000000000000000000000000 # vX.Y.Z
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    with:
+      # One lane per reviewing model; each finding is verified by a model of
+      # another family, and by the backup when that one's provider is down.
+      lanes: >-
+        [{"lane": "deepseek", "provider": "my_proxy", "model": "deepseek-v4-flash",
+          "verify-provider": "my_proxy", "verify-model": "MiniMax-M3",
+          "verify-backup-provider": "my_proxy", "verify-backup-model": "deepseek-v4-flash"},
+         {"lane": "minimax", "provider": "my_proxy", "model": "MiniMax-M3",
+          "verify-provider": "my_proxy", "verify-model": "deepseek-v4-flash",
+          "checks": ["security", "correctness"]}]
+      # The hosts your providers (or your egress proxy) are on, and what
+      # `setup` downloads from; the review job can reach nothing else.
+      egress-endpoints: |
+        llm-proxy.example.com:443
+      # Your own preparation, before any secret or model runs. For Rust:
+      #   setup: cargo fetch --locked
+      # with index.crates.io:443 and static.crates.io:443 in egress-endpoints.
+      ignore: |
+        **/Cargo.lock
+        **/CHANGELOG.md
+      # Your project's tool hints for the model (optional).
+      # tools-file: .agents/goose-review/tools.md
+    secrets:
+      # <template name>=<url> per routed template (see examples/providers).
+      PROVIDER_ROUTES: ${{ secrets.GOOSE_REVIEW_ROUTES }}
+      # NAME=value per key the templates' api_key_env name.
+      PROVIDER_ENV: ${{ secrets.GOOSE_REVIEW_PROVIDER_ENV }}

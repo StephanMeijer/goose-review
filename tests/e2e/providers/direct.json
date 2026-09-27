@@ -1,0 +1,13 @@
+{
+  "name": "direct",
+  "engine": "openai",
+  "display_name": "End-to-end test, direct",
+  "description": "Installed as written, like a provider reached directly with its own key",
+  "api_key_env": "E2E_DIRECT_KEY",
+  "base_url": "http://127.0.0.1:8765",
+  "base_path": "v1/chat/completions",
+  "models": [{ "name": "fake-b" }, { "name": "fake-verifier" }, { "name": "fake-empty" }, { "name": "fake-backup" }],
+  "supports_streaming": true,
+  "requires_auth": true,
+  "toolshim": false
+}

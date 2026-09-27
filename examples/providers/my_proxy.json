@@ -1,0 +1,16 @@
+{
+  "name": "my_proxy",
+  "engine": "openai",
+  "display_name": "My egress proxy",
+  "description": "An OpenAI-compatible route, rendered for the URL in PROVIDER_ROUTES (my_proxy=https://...)",
+  "api_key_env": "MY_PROXY_TOKEN",
+  "base_url": "https://example.invalid",
+  "base_path": "example.invalid/chat/completions",
+  "models": [
+    { "name": "deepseek-v4-flash", "context_limit": 114688, "request_params": { "max_tokens": 16384 } },
+    { "name": "MiniMax-M3" }
+  ],
+  "supports_streaming": true,
+  "requires_auth": true,
+  "toolshim": false
+}

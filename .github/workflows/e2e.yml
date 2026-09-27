@@ -1,0 +1,77 @@
+# The pre-composed review.yml end to end, on every pull request of this
+# repository, with tests/fake-goose for the models and a local server for
+# the providers' preflight. Two lanes: `alpha` through a routed provider,
+# `beta` through a direct one, slower (it posts into alpha's open thread)
+# and verified by its backup (its verifier answers empty). `assert` then
+# reads the pull request back. The branch e2e/fixture adds the planted
+# line; on other pull requests the check has nothing to review, and only
+# the summary is asserted.
+name: End-to-end
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: e2e-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  goose-review:
+    # The hand-wired variant has its own branch (e2e-hand-wired.yml): two
+    # runs on one pull request would share its summary comment.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.head_ref != 'e2e/hand-wired'
+    uses: ./.github/workflows/review.yml
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    with:
+      lanes: >-
+        [{"lane": "alpha", "provider": "routed", "model": "fake-a",
+          "verify-provider": "direct", "verify-model": "fake-verifier"},
+         {"lane": "beta", "provider": "direct", "model": "fake-b",
+          "verify-provider": "direct", "verify-model": "fake-empty",
+          "verify-backup-provider": "direct", "verify-backup-model": "fake-backup",
+          "checks": ["planted"]}]
+      checks-dir: tests/e2e/checks
+      facts-dir: tests/e2e/facts
+      providers-dir: tests/e2e/providers
+      setup: bash tests/e2e/setup.sh
+      install-goose: false
+      review-timeout-minutes: 20
+    secrets:
+      # Not secret; passed as secrets to run the same path as real ones.
+      PROVIDER_ROUTES: routed=http://127.0.0.1:8765/r1
+      PROVIDER_ENV: |
+        E2E_ROUTED_KEY=e2e-routed-key-0000
+        E2E_DIRECT_KEY=e2e-direct-key-0000
+
+  assert:
+    needs: goose-review
+    if: ${{ !cancelled() && needs.goose-review.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Read the pull request back
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: >
+          python3 tests/e2e/assert.py --repo "$REPO" --pr "$PR" --run-id "$RUN_ID"
+          --fixture tests/e2e/fixture/planted.py

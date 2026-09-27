@@ -1,14 +1,6 @@
-# One lane of the pre-composed Goose review (review.yml calls it once per
-# lane): a `review` job, where the model has a shell, and a `post` job that
-# runs no model and alone may write to the pull request.
-#
-# The split is the point. The review job holds a read-only token and its
-# network is limited to GitHub, the providers and what the caller's setup
-# needs, without sudo to lift that limit. What it writes is scrubbed of the
-# provider settings; once the model has had a shell there, nothing later in
-# that job is trusted, so `post` scrubs again on its own runner before
-# publishing anything. The job names `review` and `post` are what the
-# summary links a lane's row to.
+# One lane: `review` (the model has a shell; read-only token, network
+# blocked but for GitHub and your providers) and `post` (no model; alone
+# may write to the pull request, and scrubs again before it does).
 name: Goose review lane
 
 on:
@@ -21,48 +13,18 @@ on:
       verify-model: { type: string, required: true }
       verify-backup-provider: { type: string, default: "" }
       verify-backup-model: { type: string, default: "" }
-      checks: { type: string, default: "" }
-      jobs: { type: number, default: 2 }
-      checks-dir: { type: string, default: .agents/checks }
-      facts-dir: { type: string, default: .agents/facts }
-      providers-dir: { type: string, default: .github/goose/providers }
-      ignore: { type: string, default: "" }
-      tools-file: { type: string, default: "" }
-      rules-file: { type: string, default: "" }
-      budget-minutes: { type: number, default: 35 }
-      verify-budget-minutes: { type: number, default: 12 }
-      egress-endpoints: { type: string, default: "" }
-      setup: { type: string, default: "" }
-      runs-on: { type: string, default: ubuntu-latest }
-      review-timeout-minutes: { type: number, default: 60 }
-      install-goose: { type: boolean, default: true }
-    secrets:
-      PROVIDER_ROUTES:
-        required: false
-      PROVIDER_ENV:
-        required: false
 
 permissions: {}
 
 jobs:
   review:
-    name: review
-    runs-on: ${{ inputs.runs-on }}
-    # Bounded by time, not turns: the checks share budget-minutes and
-    # verification gets verify-budget-minutes.
-    timeout-minutes: ${{ inputs.review-timeout-minutes }}
-    # Advisory: a lane that fails must not fail the pull request; `post`
-    # says on it that the review did not run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     continue-on-error: true
     permissions:
       contents: read
-      # Read-only, for the answered findings; only that step holds the token.
       pull-requests: read
     steps:
-      # Everything after this step can reach only the endpoints listed. The
-      # model has a shell here, so sudo goes too: with it, the model could
-      # lift the policy. Artifact storage is GitHub's own accounts by name,
-      # not *.blob.core.windows.net, where anyone can create an account.
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: block
@@ -93,25 +55,17 @@ jobs:
             productionresultssa17.blob.core.windows.net:443
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
-            ${{ inputs.egress-endpoints }}
+            llm-proxy.example.com:443
 
-      # The PR head itself, not the merge commit: review comments are
-      # anchored to the head's line numbers.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      # The caller's own preparation, before any secret or model.
-      - name: Set up
-        if: inputs.setup != ''
-        shell: bash
-        env:
-          SETUP: ${{ inputs.setup }}
-        run: bash -euo pipefail -c "$SETUP"
+      # Your own preparation here, before any secret or model runs.
 
-      - uses: StephanMeijer/goose-review/review@2e4ee17c571db5aa396d0c398fcf75c334e96c17
+      - uses: StephanMeijer/goose-review/review@0000000000000000000000000000000000000000 # vX.Y.Z
         with:
           lane: ${{ inputs.lane }}
           provider: ${{ inputs.provider }}
@@ -120,27 +74,13 @@ jobs:
           verify-model: ${{ inputs.verify-model }}
           verify-backup-provider: ${{ inputs.verify-backup-provider }}
           verify-backup-model: ${{ inputs.verify-backup-model }}
-          checks: ${{ inputs.checks }}
-          jobs: ${{ inputs.jobs }}
-          checks-dir: ${{ inputs.checks-dir }}
-          facts-dir: ${{ inputs.facts-dir }}
-          providers-dir: ${{ inputs.providers-dir }}
-          ignore: ${{ inputs.ignore }}
-          tools-file: ${{ inputs.tools-file }}
-          rules-file: ${{ inputs.rules-file }}
-          budget-minutes: ${{ inputs.budget-minutes }}
-          verify-budget-minutes: ${{ inputs.verify-budget-minutes }}
-          provider-routes: ${{ secrets.PROVIDER_ROUTES }}
-          provider-env: ${{ secrets.PROVIDER_ENV }}
-          install-goose: ${{ inputs.install-goose }}
+          provider-routes: ${{ secrets.GOOSE_REVIEW_ROUTES }}
+          provider-env: ${{ secrets.GOOSE_REVIEW_PROVIDER_ENV }}
 
   post:
-    name: post
     needs: review
-    # Also after a failed or timed-out review, so the pull request says the
-    # review did not run; not when the run was cancelled.
     if: ${{ !cancelled() }}
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -173,11 +113,10 @@ jobs:
             productionresultssa17.blob.core.windows.net:443
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
-
-      - uses: StephanMeijer/goose-review/post@2e4ee17c571db5aa396d0c398fcf75c334e96c17
+      - uses: StephanMeijer/goose-review/post@0000000000000000000000000000000000000000 # vX.Y.Z
         with:
           lane: ${{ inputs.lane }}
           model: ${{ inputs.model }}
           verify-model: ${{ inputs.verify-model }}
-          provider-routes: ${{ secrets.PROVIDER_ROUTES }}
-          provider-env: ${{ secrets.PROVIDER_ENV }}
+          provider-routes: ${{ secrets.GOOSE_REVIEW_ROUTES }}
+          provider-env: ${{ secrets.GOOSE_REVIEW_PROVIDER_ENV }}

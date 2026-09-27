@@ -1,0 +1,108 @@
+# The Goose review wired by hand from the composite actions, for a job
+# layout of your own. examples/caller.yml does the same through the
+# pre-composed workflow in fewer lines. Keep the lane jobs named `review`
+# and `post` (in goose-review-lane.yml): the summary links each lane's row
+# to them by name.
+name: Goose review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: goose-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  tidy:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+      - uses: StephanMeijer/goose-review/tidy@0000000000000000000000000000000000000000 # vX.Y.Z
+
+  lane:
+    name: ${{ matrix.lane }}
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && !github.event.pull_request.draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: deepseek
+            provider: my_proxy
+            model: deepseek-v4-flash
+            verify-provider: my_proxy
+            verify-model: MiniMax-M3
+            verify-backup-provider: my_proxy
+            verify-backup-model: deepseek-v4-flash
+          - lane: minimax
+            provider: my_proxy
+            model: MiniMax-M3
+            verify-provider: my_proxy
+            verify-model: deepseek-v4-flash
+    uses: ./.github/workflows/goose-review-lane.yml
+    with:
+      lane: ${{ matrix.lane }}
+      provider: ${{ matrix.provider }}
+      model: ${{ matrix.model }}
+      verify-provider: ${{ matrix['verify-provider'] }}
+      verify-model: ${{ matrix['verify-model'] }}
+      verify-backup-provider: ${{ matrix['verify-backup-provider'] || '' }}
+      verify-backup-model: ${{ matrix['verify-backup-model'] || '' }}
+    secrets: inherit
+
+  summary:
+    needs: [tidy, lane]
+    if: ${{ !cancelled() && needs.lane.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            results-receiver.actions.githubusercontent.com:443
+            productionresultssa0.blob.core.windows.net:443
+            productionresultssa1.blob.core.windows.net:443
+            productionresultssa2.blob.core.windows.net:443
+            productionresultssa3.blob.core.windows.net:443
+            productionresultssa4.blob.core.windows.net:443
+            productionresultssa5.blob.core.windows.net:443
+            productionresultssa6.blob.core.windows.net:443
+            productionresultssa7.blob.core.windows.net:443
+            productionresultssa8.blob.core.windows.net:443
+            productionresultssa9.blob.core.windows.net:443
+            productionresultssa10.blob.core.windows.net:443
+            productionresultssa11.blob.core.windows.net:443
+            productionresultssa12.blob.core.windows.net:443
+            productionresultssa13.blob.core.windows.net:443
+            productionresultssa14.blob.core.windows.net:443
+            productionresultssa15.blob.core.windows.net:443
+            productionresultssa16.blob.core.windows.net:443
+            productionresultssa17.blob.core.windows.net:443
+            productionresultssa18.blob.core.windows.net:443
+            productionresultssa19.blob.core.windows.net:443
+      - uses: StephanMeijer/goose-review/summary@0000000000000000000000000000000000000000 # vX.Y.Z

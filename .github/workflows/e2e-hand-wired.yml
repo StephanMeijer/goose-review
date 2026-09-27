@@ -1,0 +1,157 @@
+# The hand-wired example (examples/hand-wired/) end to end, with this
+# pull request's own actions (./review and so on) rather than pinned ones,
+# tests/fake-goose for the models and a local server for the preflight.
+# Only on the branch e2e/hand-wired: two review runs on one pull request
+# would share its summary comment.
+name: End-to-end (hand-wired)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: e2e-hand-wired-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  tidy:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.head_ref == 'e2e/hand-wired'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: |
+            tidy
+            review
+            post
+            summary
+            goose_review.py
+            setup-providers.sh
+            render-provider.sh
+            options.sh
+          persist-credentials: false
+      - uses: ./tidy
+
+  lane:
+    name: ${{ matrix.lane }}
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.head_ref == 'e2e/hand-wired'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: alpha
+            provider: routed
+            model: fake-a
+            verify-provider: direct
+            verify-model: fake-verifier
+          - lane: beta
+            provider: direct
+            model: fake-b
+            verify-provider: direct
+            verify-model: fake-empty
+            verify-backup-provider: direct
+            verify-backup-model: fake-backup
+    uses: ./.github/workflows/e2e-hand-wired-lane.yml
+    with:
+      lane: ${{ matrix.lane }}
+      provider: ${{ matrix.provider }}
+      model: ${{ matrix.model }}
+      verify-provider: ${{ matrix['verify-provider'] }}
+      verify-model: ${{ matrix['verify-model'] }}
+      verify-backup-provider: ${{ matrix['verify-backup-provider'] || '' }}
+      verify-backup-model: ${{ matrix['verify-backup-model'] || '' }}
+
+  summary:
+    needs: [tidy, lane]
+    if: ${{ !cancelled() && needs.lane.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            results-receiver.actions.githubusercontent.com:443
+            productionresultssa0.blob.core.windows.net:443
+            productionresultssa1.blob.core.windows.net:443
+            productionresultssa2.blob.core.windows.net:443
+            productionresultssa3.blob.core.windows.net:443
+            productionresultssa4.blob.core.windows.net:443
+            productionresultssa5.blob.core.windows.net:443
+            productionresultssa6.blob.core.windows.net:443
+            productionresultssa7.blob.core.windows.net:443
+            productionresultssa8.blob.core.windows.net:443
+            productionresultssa9.blob.core.windows.net:443
+            productionresultssa10.blob.core.windows.net:443
+            productionresultssa11.blob.core.windows.net:443
+            productionresultssa12.blob.core.windows.net:443
+            productionresultssa13.blob.core.windows.net:443
+            productionresultssa14.blob.core.windows.net:443
+            productionresultssa15.blob.core.windows.net:443
+            productionresultssa16.blob.core.windows.net:443
+            productionresultssa17.blob.core.windows.net:443
+            productionresultssa18.blob.core.windows.net:443
+            productionresultssa19.blob.core.windows.net:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: |
+            tidy
+            review
+            post
+            summary
+            goose_review.py
+            setup-providers.sh
+            render-provider.sh
+            options.sh
+          persist-credentials: false
+      - uses: ./summary
+
+  assert:
+    needs: summary
+    if: ${{ !cancelled() && needs.summary.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Read the pull request back
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: >
+          python3 tests/e2e/assert.py --repo "$REPO" --pr "$PR" --run-id "$RUN_ID"
+          --fixture tests/e2e/fixture/planted.py
