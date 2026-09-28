@@ -56,6 +56,10 @@ jobs:
             model: MiniMax-M3
             verify-provider: my_proxy
             verify-model: deepseek-v4-flash
+    # The most the lane's jobs use: review reads, post writes the review.
+    permissions:
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/goose-review-lane.yml
     with:
       lane: ${{ matrix.lane }}

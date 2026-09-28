@@ -115,6 +115,10 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(inputs.lanes) }}
+    # The most the lane's jobs use: review reads, post writes the review.
+    permissions:
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/lane.yml
     with:
       lane: ${{ matrix.lane }}

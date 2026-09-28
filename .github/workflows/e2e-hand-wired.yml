@@ -69,6 +69,10 @@ jobs:
             verify-model: fake-empty
             verify-backup-provider: direct
             verify-backup-model: fake-backup
+    # The most the lane's jobs use: review reads, post writes the review.
+    permissions:
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/e2e-hand-wired-lane.yml
     with:
       lane: ${{ matrix.lane }}
