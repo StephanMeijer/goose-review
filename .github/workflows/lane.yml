@@ -109,7 +109,7 @@ jobs:
       # The caller's tools, pinned by sha256, before its setup (which may
       # use them) and before any secret or model.
       - if: inputs.tools != ''
-        uses: StephanMeijer/goose-review/tools@a812bd2139e23afc0ce79990a9558d75305cdd99
+        uses: StephanMeijer/goose-review/tools@54f2bd9c019e42a84d643dd59bf1fccc376aac70
         with:
           tools: ${{ inputs.tools }}
 
@@ -121,7 +121,7 @@ jobs:
           SETUP: ${{ inputs.setup }}
         run: bash -euo pipefail -c "$SETUP"
 
-      - uses: StephanMeijer/goose-review/review@a812bd2139e23afc0ce79990a9558d75305cdd99
+      - uses: StephanMeijer/goose-review/review@54f2bd9c019e42a84d643dd59bf1fccc376aac70
         with:
           lane: ${{ inputs.lane }}
           provider: ${{ inputs.provider }}
@@ -185,7 +185,7 @@ jobs:
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
 
-      - uses: StephanMeijer/goose-review/post@a812bd2139e23afc0ce79990a9558d75305cdd99
+      - uses: StephanMeijer/goose-review/post@54f2bd9c019e42a84d643dd59bf1fccc376aac70
         with:
           lane: ${{ inputs.lane }}
           model: ${{ inputs.model }}
