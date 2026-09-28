@@ -34,7 +34,7 @@ def check_file(name: str, paths: str = "[]") -> str:
 
 def options(**overrides: object) -> argparse.Namespace:
     values = {"checks_dir": ".agents/checks", "check": None, "facts_dir": ".agents/facts",
-              "ignore": None, "tools_file": None, "rules_file": None}
+              "ignore": None, "tools_file": None, "tools": None, "rules_file": None}
     return argparse.Namespace(**{**values, **overrides})
 
 

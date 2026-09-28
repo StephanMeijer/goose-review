@@ -51,6 +51,11 @@ inputs:
   rules-file:
     description: A file whose text replaces the built-in "Only failures that can happen" rules. Optional.
     default: ""
+  tools:
+    description: >-
+      The caller's tools, as given to the tools action (which installs
+      them): announced to the model, each with its `use`. Optional.
+    default: ""
   jobs:
     description: Checks run at once.
     default: "2"
@@ -216,6 +221,7 @@ runs:
         FACTS_DIR: ${{ inputs.facts-dir }}
         IGNORE: ${{ inputs.ignore }}
         TOOLS_FILE: ${{ inputs.tools-file }}
+        TOOLS: ${{ inputs.tools }}
         RULES_FILE: ${{ inputs.rules-file }}
       run: |
         source "$GITHUB_ACTION_PATH/../options.sh"
@@ -240,6 +246,7 @@ runs:
         FACTS_DIR: ${{ inputs.facts-dir }}
         IGNORE: ${{ inputs.ignore }}
         TOOLS_FILE: ${{ inputs.tools-file }}
+        TOOLS: ${{ inputs.tools }}
         RULES_FILE: ${{ inputs.rules-file }}
       run: |
         source "$GITHUB_ACTION_PATH/../options.sh"

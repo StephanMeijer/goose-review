@@ -3,8 +3,8 @@
 # runs no model and alone may write to the pull request.
 #
 # The split is the point. The review job holds a read-only token and its
-# network is limited to GitHub, the providers and what the caller's setup
-# needs, without sudo to lift that limit. What it writes is scrubbed of the
+# network is limited to GitHub, the providers and what the caller's tools
+# and setup need, without sudo to lift that limit. What it writes is scrubbed of the
 # provider settings; once the model has had a shell there, nothing later in
 # that job is trusted, so `post` scrubs again on its own runner before
 # publishing anything. The job names `review` and `post` are what the
@@ -28,6 +28,7 @@ on:
       providers-dir: { type: string, default: .github/goose/providers }
       ignore: { type: string, default: "" }
       tools-file: { type: string, default: "" }
+      tools: { type: string, default: "" }
       rules-file: { type: string, default: "" }
       budget-minutes: { type: number, default: 35 }
       verify-budget-minutes: { type: number, default: 12 }
@@ -105,6 +106,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The caller's tools, pinned by sha256, before its setup (which may
+      # use them) and before any secret or model.
+      - if: inputs.tools != ''
+        uses: StephanMeijer/goose-review/tools@a812bd2139e23afc0ce79990a9558d75305cdd99
+        with:
+          tools: ${{ inputs.tools }}
+
       # The caller's own preparation, before any secret or model.
       - name: Set up
         if: inputs.setup != ''
@@ -129,6 +137,7 @@ jobs:
           providers-dir: ${{ inputs.providers-dir }}
           ignore: ${{ inputs.ignore }}
           tools-file: ${{ inputs.tools-file }}
+          tools: ${{ inputs.tools }}
           rules-file: ${{ inputs.rules-file }}
           budget-minutes: ${{ inputs.budget-minutes }}
           verify-budget-minutes: ${{ inputs.verify-budget-minutes }}

@@ -54,7 +54,17 @@ jobs:
       checks-dir: tests/e2e/checks
       facts-dir: tests/e2e/facts
       providers-dir: tests/e2e/providers
-      setup: bash tests/e2e/setup.sh
+      # A real tool from a release archive: setup fails unless the tools
+      # action installed it on PATH before setup runs.
+      tools: |
+        - name: actionlint
+          version: v1.7.12
+          url: https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          sha256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          use: Lint a workflow file.
+      setup: |
+        test "$(command -v actionlint)" = "$RUNNER_TEMP/tools-bin/actionlint" && actionlint --version
+        bash tests/e2e/setup.sh
       # One real host beyond GitHub, which setup.sh fetches from: proves the
       # caller's entries reach the review job's allow-list intact (v0.1.0
       # broke them when they came as lines).

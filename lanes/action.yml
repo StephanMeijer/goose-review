@@ -4,6 +4,7 @@ description: >-
   them against the checks and provider templates in the checkout, and
   outputs them as JSON for a lane matrix. A mistyped key, a missing model,
   an unknown check or provider is an error here, before any lane runs.
+  So is a malformed tool, when the caller's tools are given.
 author: Stephan Meijer
 
 inputs:
@@ -16,6 +17,9 @@ inputs:
   providers-dir:
     description: Directory of the provider templates, to check each lane's providers. Skipped when missing.
     default: .github/goose/providers
+  tools:
+    description: The caller's tools (see the tools action), checked here too. Optional.
+    default: ""
 
 outputs:
   lanes:
@@ -32,6 +36,7 @@ runs:
         GOOSE_REVIEW_LANES: ${{ inputs.lanes }}
         CHECKS_DIR: ${{ inputs.checks-dir }}
         PROVIDERS_DIR: ${{ inputs.providers-dir }}
+        GOOSE_REVIEW_TOOLS: ${{ inputs.tools }}
       run: >
         python3 "$GITHUB_ACTION_PATH/../goose_review.py" lanes
         --checks-dir "$CHECKS_DIR" --providers-dir "$PROVIDERS_DIR"

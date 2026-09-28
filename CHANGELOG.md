@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- `tools`: install your own tools in the review job and tell the model it
+  may run them -- a linter, `helm`, `kubeconform`. Each is a download fixed
+  by its sha256 (a binary, or one file out of an archive) with a `use` line
+  the model reads. They are installed before `setup`, which can use them,
+  and the `plan` job checks the list. The new `tools` action does the
+  installing for hand-wired callers; the `review` action's `tools` input
+  announces them.
+
 ## 0.3.2
 
 - The workflow's jobs have their plain names again (`plan`, `tidy`,

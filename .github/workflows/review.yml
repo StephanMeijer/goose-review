@@ -57,6 +57,14 @@ on:
         description: A file replacing the built-in rules.
         type: string
         default: ""
+      tools:
+        description: >-
+          Tools to install in the review job and announce to the model, as
+          YAML (a list of mappings) or JSON. Each: name, url, sha256, use,
+          and optionally path and version. Installed before `setup`;
+          checked by the plan job. See the README.
+        type: string
+        default: ""
       budget-minutes:
         type: number
         default: 35
@@ -130,6 +138,7 @@ jobs:
           lanes: ${{ inputs.lanes }}
           checks-dir: ${{ inputs.checks-dir }}
           providers-dir: ${{ inputs.providers-dir }}
+          tools: ${{ inputs.tools }}
 
   # Then, in seconds: collapse the review's own resolved threads, and mark
   # this run as running in the summary comment.
@@ -178,6 +187,7 @@ jobs:
       providers-dir: ${{ inputs.providers-dir }}
       ignore: ${{ inputs.ignore }}
       tools-file: ${{ inputs.tools-file }}
+      tools: ${{ inputs.tools }}
       rules-file: ${{ inputs.rules-file }}
       budget-minutes: ${{ inputs.budget-minutes }}
       verify-budget-minutes: ${{ inputs.verify-budget-minutes }}

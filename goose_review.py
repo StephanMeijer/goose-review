@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import io
 import concurrent.futures
 import itertools
 import json
@@ -32,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -39,6 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -59,6 +63,9 @@ class Config:
     # Appended to TOOLS: the project's own commands (a toolchain, where the
     # dependencies' sources are, what not to run).
     tools_extra: str = ""
+    # The caller's own tools (validated `tools` entries), installed by the
+    # tools action and announced after TOOLS.
+    tools: tuple[dict, ...] = ()
     # Added to every check's and the verifier's prompt; REALISTIC_TRIGGER
     # unless the caller replaces it.
     rules: str = ""
@@ -179,10 +186,32 @@ it to prove or disprove a finding, not to browse. Useful commands:
 """
 
 
+INSTALLED_TOOLS = """\
+## Installed for this repository
+
+These are installed too, and the rule above against building, testing and
+linting does not cover them: run one when its output settles a finding.
+They work offline unless their line says otherwise.
+
+"""
+
+
+def installed_prompt() -> str:
+    """The caller's tools, one line each: the command, its version, its use."""
+    if not CONFIG.tools:
+        return ""
+    lines = [f"- `{t['name']}`" + (f" ({t['version']})" if t["version"] else "") + f": {t['use']}"
+             for t in CONFIG.tools]
+    return INSTALLED_TOOLS + "\n".join(lines) + "\n"
+
+
 def tools_prompt(base: str) -> str:
-    """TOOLS for this change, with the project's own hints after it."""
+    """TOOLS for this change, the caller's installed tools, then the
+    project's own hints."""
     extra = CONFIG.tools_extra.strip()
-    return TOOLS.format(base=base) + (f"\n{extra}\n" if extra else "")
+    installed = installed_prompt()
+    return (TOOLS.format(base=base) + (f"\n{installed}" if installed else "")
+            + (f"\n{extra}\n" if extra else ""))
 
 OUTPUT_CONTRACT = """\
 ## Output
@@ -434,13 +463,19 @@ def strip_comment(line: str) -> str:
 
 def parse_lanes(text: str) -> list[dict]:
     """The lanes in `text`: JSON, or a YAML block list of mappings."""
+    return parse_mappings(text, "lanes", "lane")
+
+
+def parse_mappings(text: str, what: str, item: str) -> list[dict]:
+    """The `what` in `text` (lanes, tools): JSON, or a YAML block list of
+    flat mappings, each one `item`."""
     if text.lstrip().startswith("["):
         try:
             data = json.loads(text)
         except ValueError as error:
-            raise LanesError(f"lanes: not valid JSON: {error}")
-        if not isinstance(data, list) or not all(isinstance(lane, dict) for lane in data):
-            raise LanesError("lanes: must be a list of mappings")
+            raise LanesError(f"{what}: not valid JSON: {error}")
+        if not isinstance(data, list) or not all(isinstance(entry, dict) for entry in data):
+            raise LanesError(f"{what}: must be a list of mappings")
         return data
     lanes: list[dict] = []
     item_indent = key_indent = None
@@ -451,7 +486,7 @@ def parse_lanes(text: str) -> list[dict]:
             continue
         indent = len(line) - len(line.lstrip())
         body = line.strip()
-        where = f"lanes, line {n}"
+        where = f"{what}, line {n}"
         if body == "-" or body.startswith("- "):
             if item_indent is None or indent == item_indent:
                 # A new lane; its first key may share the line.
@@ -471,17 +506,17 @@ def parse_lanes(text: str) -> list[dict]:
             else:
                 raise LanesError(f"{where}: a list item here belongs to no key")
         if not lanes:
-            raise LanesError(f"{where}: lanes must be a list: start each lane with `- `")
+            raise LanesError(f"{where}: {what} must be a list: start each {item} with `- `")
         key_indent = indent if key_indent is None else key_indent
         if indent != key_indent:
-            raise LanesError(f"{where}: indented unlike the lane's other keys")
+            raise LanesError(f"{where}: indented unlike the {item}'s other keys")
         key, sep, value = body.partition(":")
-        # Any key-shaped name: validate_lanes names the ones no lane has.
+        # Any key-shaped name: validation names the ones no entry has.
         if not sep or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", key.strip()):
             raise LanesError(f"{where}: expected `key: value`, got: {body}")
         key = key.strip()
         if key in lanes[-1]:
-            raise LanesError(f"{where}: `{key}` given twice in one lane")
+            raise LanesError(f"{where}: `{key}` given twice in one {item}")
         if value.strip():
             lanes[-1][key] = yaml_scalar(value, where)
             list_key = None
@@ -554,6 +589,7 @@ def cmd_lanes(args: argparse.Namespace) -> None:
     providers = sorted(p.stem for p in providers_dir.glob("*.json")) if providers_dir.is_dir() else None
     try:
         lanes = validate_lanes(parse_lanes(os.environ.get("GOOSE_REVIEW_LANES", "")), checks, providers)
+        parse_tools(os.environ.get("GOOSE_REVIEW_TOOLS", ""))
     except LanesError as error:
         for line in str(error).splitlines():
             print(f"::error::{line}", file=sys.stderr)
@@ -580,12 +616,148 @@ def configure(args: argparse.Namespace) -> None:
         facts_dir=Path(args.facts_dir),
         ignore=tuple(g.strip() for g in args.ignore or [] if g.strip()),
         tools_extra=Path(args.tools_file).read_text(encoding="utf-8") if args.tools_file else "",
+        tools=tuple(parse_tools(args.tools or "")),
         rules=Path(args.rules_file).read_text(encoding="utf-8").strip() + "\n" if args.rules_file else "",
     )
 
 
 def rules_prompt() -> str:
     return CONFIG.rules or REALISTIC_TRIGGER
+
+
+TOOL_REQUIRED = ("name", "url", "sha256", "use")
+TOOL_OPTIONAL = ("path", "version")
+TOOL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# Installed by the review action itself, or the review's own commands.
+TOOL_RESERVED = {"goose", "rg", "fd", "ast-grep", "git", "python3"}
+TOOL_MAX_BYTES = 512 * 1024 * 1024
+
+
+def parse_tools(text: str) -> list[dict]:
+    """The tools in `text` (YAML or JSON), checked; none when it is blank."""
+    return validate_tools(parse_mappings(text, "tools", "tool")) if text.strip() else []
+
+
+def validate_tools(tools: list[dict]) -> list[dict]:
+    """Every tool complete and well-formed, normalised: all keys present,
+    as strings. A download is fixed by its sha256, so the URL is https."""
+    out, names, problems = [], set(), []
+    for i, tool in enumerate(tools, 1):
+        label = f"tool {i}" + (f" ({tool['name']})" if isinstance(tool.get("name"), str) else "")
+        unknown = sorted(set(tool) - set(TOOL_REQUIRED) - set(TOOL_OPTIONAL))
+        if unknown:
+            problems.append(f"{label}: unknown key(s) {', '.join(unknown)}; a tool has "
+                            f"{', '.join(TOOL_REQUIRED + TOOL_OPTIONAL)}")
+        if any(not isinstance(v, (str, int, float)) for v in tool.values()):
+            problems.append(f"{label}: every value is a single string")
+            continue
+        entry = {k: str(tool.get(k, "")).strip() for k in TOOL_REQUIRED + TOOL_OPTIONAL}
+        missing = [k for k in TOOL_REQUIRED if not entry[k]]
+        if missing:
+            problems.append(f"{label}: missing {', '.join(missing)}")
+            continue
+        name = entry["name"]
+        if not TOOL_NAME_RE.fullmatch(name) or name in TOOL_RESERVED:
+            problems.append(f"{label}: the name is the command: [A-Za-z0-9._-]+, and not one of "
+                            f"{', '.join(sorted(TOOL_RESERVED))}")
+        if name in names:
+            problems.append(f"{label}: the name `{name}` is used twice")
+        names.add(name)
+        if not entry["url"].startswith("https://"):
+            problems.append(f"{label}: url must be https://")
+        if not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"].lower()):
+            problems.append(f"{label}: sha256 must be 64 hex digits")
+        entry["sha256"] = entry["sha256"].lower()
+        path = entry["path"]
+        if path and (path.startswith("/") or ".." in path.split("/")):
+            problems.append(f"{label}: path is relative to the archive's root, without `..`")
+        if path and archive_kind(entry["url"]) is None:
+            problems.append(f"{label}: path is for an archive (.tar.gz, .tgz, .tar.xz, .zip); this url is a file")
+        if "\n" in entry["use"] or len(entry["use"]) > 500:
+            problems.append(f"{label}: use is one line (at most 500 characters)")
+        out.append(entry)
+    if problems:
+        raise LanesError("\n".join(problems))
+    return out
+
+
+def archive_kind(url: str) -> str | None:
+    path = urllib.parse.urlparse(url).path.lower()
+    if path.endswith((".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".tar")):
+        return "tar"
+    if path.endswith(".zip"):
+        return "zip"
+    return None
+
+
+def download(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=120) as response:
+        data = response.read(TOOL_MAX_BYTES + 1)
+    if len(data) > TOOL_MAX_BYTES:
+        raise LanesError(f"{url}: larger than {TOOL_MAX_BYTES // (1024 * 1024)} MB")
+    return data
+
+
+def tool_binary(tool: dict, data: bytes) -> bytes:
+    """The tool's executable out of its download: the file itself, or the
+    archive member at `path` (default: the one file named like the tool)."""
+    kind, name, path = archive_kind(tool["url"]), tool["name"], tool["path"].strip("/")
+    if kind is None:
+        return data
+    if kind == "zip":
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            members = {i.filename.removeprefix("./"): i for i in archive.infolist() if not i.is_dir()}
+            chosen = pick_member(tool, members, path, name)
+            return archive.read(members[chosen])
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        members = {m.name.removeprefix("./"): m for m in archive.getmembers() if m.isfile()}
+        chosen = pick_member(tool, members, path, name)
+        extracted = archive.extractfile(members[chosen])
+        assert extracted is not None
+        return extracted.read()
+
+
+def pick_member(tool: dict, members: dict, path: str, name: str) -> str:
+    if path:
+        if path not in members:
+            raise LanesError(f"tool {name}: no file {path} in {tool['url']} (it has {', '.join(sorted(members)[:20])})")
+        return path
+    named = [m for m in members if m.rsplit("/", 1)[-1] == name]
+    if len(named) != 1:
+        raise LanesError(f"tool {name}: {len(named)} files named {name} in {tool['url']}; give its `path` "
+                         f"(it has {', '.join(sorted(members)[:20])})")
+    return named[0]
+
+
+def install_tool(tool: dict, bin_dir: Path, fetch=download) -> Path:
+    """Download the tool, check its sha256, and put its executable in bin_dir."""
+    data = fetch(tool["url"])
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != tool["sha256"]:
+        raise LanesError(f"tool {tool['name']}: {tool['url']} has sha256 {digest}, not {tool['sha256']}")
+    target = bin_dir / tool["name"]
+    target.write_bytes(tool_binary(tool, data))
+    target.chmod(0o755)
+    return target
+
+
+def cmd_tools(args: argparse.Namespace) -> None:
+    """Read and check the caller's tools in $GOOSE_REVIEW_TOOLS; with
+    --install, download each (checked by sha256) into that directory."""
+    try:
+        tools = parse_tools(os.environ.get("GOOSE_REVIEW_TOOLS", ""))
+        if args.install:
+            bin_dir = Path(args.install)
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            for tool in tools:
+                print(f"installed {tool['name']}: {install_tool(tool, bin_dir)}", file=sys.stderr)
+    except (LanesError, OSError, tarfile.TarError, zipfile.BadZipFile) as error:
+        for line in str(error).splitlines():
+            print(f"::error::{line}", file=sys.stderr)
+        raise SystemExit(1)
+    for tool in tools:
+        print(f"tool {tool['name']}" + (f" {tool['version']}" if tool["version"] else "") + f": {tool['use']}",
+              file=sys.stderr)
 
 
 def load_checks(directory: Path) -> list[Check]:
@@ -2608,6 +2780,7 @@ def main() -> None:
         p.add_argument("--facts-dir", default=".agents/facts", help="directory of the facts files; missing means none")
         p.add_argument("--ignore", action="append", help="glob never reviewed; repeatable, and the same for review and verify")
         p.add_argument("--tools-file", help="appended to the tools prompt: the project's own commands")
+        p.add_argument("--tools", help="the caller's installed tools (YAML or JSON), announced in the tools prompt")
         p.add_argument("--rules-file", help="replaces the rules added to every check's and the verifier's prompt")
     verify.set_defaults(func=cmd_verify)
 
@@ -2615,6 +2788,10 @@ def main() -> None:
     lanes.add_argument("--checks-dir", default=".agents/checks", help="to check each lane's check names; skipped when missing")
     lanes.add_argument("--providers-dir", default=".github/goose/providers", help="to check each lane's providers; skipped when missing")
     lanes.set_defaults(func=cmd_lanes)
+
+    tools = sub.add_parser("tools", help="read and check the tools in $GOOSE_REVIEW_TOOLS (YAML or JSON); install them")
+    tools.add_argument("--install", help="download each tool, checked by its sha256, into this directory")
+    tools.set_defaults(func=cmd_tools)
 
     ans = sub.add_parser("answered", help="write the pull request's answered lane findings, for `verify`")
     ans.add_argument("--repo", required=True, help="owner/name")

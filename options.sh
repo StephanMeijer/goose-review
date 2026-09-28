@@ -19,6 +19,7 @@ lines() {
 options=(--checks-dir "${CHECKS_DIR:-.agents/checks}" --facts-dir "${FACTS_DIR:-.agents/facts}")
 while IFS= read -r glob; do options+=(--ignore "$glob"); done < <(lines "${IGNORE:-}")
 if [ -n "${TOOLS_FILE:-}" ]; then options+=(--tools-file "$TOOLS_FILE"); fi
+if [ -n "${TOOLS:-}" ]; then options+=(--tools "$TOOLS"); fi
 if [ -n "${RULES_FILE:-}" ]; then options+=(--rules-file "$RULES_FILE"); fi
 
 # Check names are file names: split on whitespace and commas, so a lane's

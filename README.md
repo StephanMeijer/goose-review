@@ -20,7 +20,7 @@ It was built for [NotedThat](https://github.com/NotedThat/NotedThat) (PR
 | **Lanes** | your workflow | Each lane: a reviewing model, a verifying model (another family), optionally a backup verifier and a subset of the checks. |
 
 Plus, optionally, the paths never reviewed (`ignore`), tool hints for your
-stack (`tools-file`), and your own rules to replace the built-in "Only
+stack (`tools-file`), tools to install for the model (`tools`), and your own rules to replace the built-in "Only
 failures that can happen" (`rules-file`).
 
 ## Two ways to use it
@@ -67,6 +67,7 @@ Inputs:
 - `lanes` (required): YAML (a list of mappings, see [Lanes](#lanes)) or JSON.
 - Directories: `checks-dir`, `facts-dir`, `providers-dir`.
 - Prompt and diff: `ignore`, `tools-file`, `rules-file`.
+- `tools`: linters, renderers and the like to install in the review job and announce to the model (see [Tools](#tools)).
 - Time budgets: `budget-minutes` (35) and `verify-budget-minutes` (12).
 - The review job: `egress-endpoints` (a JSON list of the hosts it may reach beyond GitHub; the allow-list splits on single spaces),
   `setup` (your preparation, e.g. `cargo fetch --locked`), `runs-on`,
@@ -78,7 +79,7 @@ Secrets:
 
 ### 2. The composite actions (your own wiring)
 
-`lanes`, `tidy`, `review`, `post` and `summary` are what the workflow is made of (`lanes` turns YAML lanes into a matrix; optional when you write the matrix yourself);
+`lanes`, `tools`, `tidy`, `review`, `post` and `summary` are what the workflow is made of (`lanes` turns YAML lanes into a matrix; optional when you write the matrix yourself; `tools` installs your tools in the review job, before your setup, and the `review` action takes the same list to announce them);
 [`examples/hand-wired/`](examples/hand-wired/) wires them by hand.
 
 - `tidy` first: it collapses the review's own resolved threads and marks
@@ -113,13 +114,44 @@ checks every lane: an unknown key (`verify_model`), a missing one, a
 repeated name, half a backup, a check or provider that is not in your
 directories. Each one stops the run, with the error shown on it.
 
+## Tools
+
+The model gets a shell with git, ripgrep, fd and ast-grep, and is told not
+to build, test or lint. `tools` installs more, and tells the model it may
+run them: a chart repository's `helm` and `kubeconform`, a linter whose
+output settles a finding.
+
+```yaml
+tools: |
+  - name: helm                        # the command; installed on PATH as this
+    version: v4.1.4                   # optional: shown to the model
+    url: https://get.helm.sh/helm-v4.1.4-linux-amd64.tar.gz
+    sha256: 70b2c30a19da4db264dfd68c8a3664e05093a361cefd89572ffb36f8abfa3d09
+    path: linux-amd64/helm            # optional: the file in the archive
+    use: "Render a chart: `helm template t charts/app -f ci/values.yaml`."
+```
+
+- `url` is an https download: a binary, or a `.tar.gz`, `.tgz`, `.tar.xz`
+  or `.zip` archive holding it. `path` picks the file in an archive; without
+  it, the one file named like the tool is taken.
+- `sha256` is the download's; a mismatch stops the review job.
+- `use` is the one line the model reads about the tool: what it is for and
+  how to run it. Say so in it if the tool needs the network.
+- The download host must be in `egress-endpoints` (GitHub's release
+  downloads already are).
+
+The tools are installed before `setup`, so it can use them (e.g. `helm
+dependency build`), and the `plan` job checks the list before any lane runs.
+Your `tools-file` hints come after them in the prompt.
+
 ## How a run goes
 
 1. **tidy**: collapses the review's own resolved threads as outdated, and
    marks the run as running in the summary comment.
 2. **review**, per lane, in a job with a read-only token and its network
    blocked (harden-runner) except for GitHub and your providers:
-   1. Install Goose, plus ripgrep, fd and ast-grep (all pinned by sha256).
+   1. Install your `tools`, run your `setup`, then install Goose, plus
+      ripgrep, fd and ast-grep (all pinned by sha256).
    2. Install your provider templates and ask each provider for its models
       (preflight).
    3. Collect the PR text and the findings someone already answered on this
@@ -171,7 +203,7 @@ and the symptom. ...
 The engine adds the rest of the prompt:
 - the rules ("Only failures that can happen", or your `rules-file`);
 - the matching facts;
-- the tools, with your `tools-file`;
+- the tools, with your `tools` and your `tools-file`;
 - the output format;
 - the diff of the files the check covers.
 
