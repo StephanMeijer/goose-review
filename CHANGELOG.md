@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- The workflow's jobs have their plain names again (`plan`, `tidy`,
+  `<lane> / review`, `<lane> / post`, `summary`): the numbered ones of 0.3.1
+  read worse. The summary still reads both.
+
 ## 0.3.1
 
 - The pre-composed workflow's jobs are numbered by stage (`1 plan`, `2 tidy`,

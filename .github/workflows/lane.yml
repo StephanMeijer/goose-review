@@ -7,8 +7,8 @@
 # needs, without sudo to lift that limit. What it writes is scrubbed of the
 # provider settings; once the model has had a shell there, nothing later in
 # that job is trusted, so `post` scrubs again on its own runner before
-# publishing anything. The summary links a lane's row to its jobs by their
-# names: `review`, and `review → post`, named so it sorts right after it.
+# publishing anything. The job names `review` and `post` are what the
+# summary links a lane's row to.
 name: Goose review lane
 
 on:
@@ -137,7 +137,7 @@ jobs:
           install-goose: ${{ inputs.install-goose }}
 
   post:
-    name: review → post
+    name: post
     needs: review
     # Also after a failed or timed-out review, so the pull request says the
     # review did not run; not when the run was cancelled.
