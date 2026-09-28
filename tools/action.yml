@@ -1,0 +1,28 @@
+name: Goose review - tools
+description: >-
+  Installs the caller's tools in the review job: each a download fixed by
+  its sha256 (a release binary, or one file out of a release archive), put
+  on PATH. It runs before the caller's setup, which can use them, and
+  before any secret or model. Give the review action the same `tools`: it
+  announces them to the model.
+author: Stephan Meijer
+
+inputs:
+  tools:
+    description: >-
+      The tools, as YAML (a list of mappings) or JSON. Each: name (the
+      command), url (https), sha256, use (one line telling the model what it
+      is for and how to run it), and optionally path (the file in an archive)
+      and version. See the README.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install the tools
+      shell: bash
+      env:
+        GOOSE_REVIEW_TOOLS: ${{ inputs.tools }}
+      run: |
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" tools --install "$RUNNER_TEMP/tools-bin"
+        echo "$RUNNER_TEMP/tools-bin" >> "$GITHUB_PATH"
