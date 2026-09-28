@@ -47,9 +47,12 @@ jobs:
     uses: StephanMeijer/goose-review/.github/workflows/review.yml@ffcb24d3050783170c5847ed347d55f6ec2d799f # v0.2.0
     permissions: { contents: read, actions: read, issues: write, pull-requests: write }
     with:
-      lanes: >-
-        [{"lane": "deepseek", "provider": "my_proxy", "model": "deepseek-v4-flash",
-          "verify-provider": "my_proxy", "verify-model": "MiniMax-M3"}]
+      lanes: |
+        - lane: deepseek
+          provider: my_proxy
+          model: deepseek-v4-flash
+          verify-provider: my_proxy
+          verify-model: MiniMax-M3
       egress-endpoints: '["llm-proxy.example.com:443"]'
     secrets:
       PROVIDER_ROUTES: ${{ secrets.GOOSE_REVIEW_ROUTES }}
@@ -61,9 +64,7 @@ The workflow pins its own actions to the code of that commit, so the SHA
 pins everything it runs.
 
 Inputs:
-- `lanes` (required): a JSON list. Each lane is `{lane, provider, model,
-  verify-provider, verify-model, verify-backup-provider?,
-  verify-backup-model?, checks?, jobs?}`.
+- `lanes` (required): YAML (a list of mappings, see [Lanes](#lanes)) or JSON.
 - Directories: `checks-dir`, `facts-dir`, `providers-dir`.
 - Prompt and diff: `ignore`, `tools-file`, `rules-file`.
 - Time budgets: `budget-minutes` (35) and `verify-budget-minutes` (12).
@@ -77,7 +78,7 @@ Secrets:
 
 ### 2. The composite actions (your own wiring)
 
-`tidy`, `review`, `post` and `summary` are what the workflow is made of;
+`lanes`, `tidy`, `review`, `post` and `summary` are what the workflow is made of (`lanes` turns YAML lanes into a matrix; optional when you write the matrix yourself);
 [`examples/hand-wired/`](examples/hand-wired/) wires them by hand.
 
 - `tidy` first: it collapses the review's own resolved threads and marks
@@ -87,6 +88,30 @@ Secrets:
 - `summary` last.
 
 Each action's inputs are documented in its `action.yml`.
+
+## Lanes
+
+A lane is one reviewing model and the model that verifies its findings:
+
+```yaml
+lanes: |
+  - lane: deepseek                    # [a-z0-9-]+; names its review and its row
+    provider: my_proxy                # a template in providers-dir
+    model: deepseek-v4-flash
+    verify-provider: my_proxy         # use another model family than the reviewer's
+    verify-model: MiniMax-M3
+    verify-backup-provider: my_proxy  # optional: verifies when the verifier's
+    verify-backup-model: deepseek-v4-flash  #   provider answers empty
+    checks: [security, correctness]   # optional: a subset of checks-dir
+    jobs: 2                           # optional: checks at once (1-16, default 2)
+```
+
+Only this much YAML is read: a list of flat mappings whose values are plain
+or quoted scalars, or lists of them (`[a, b]`, or one `- item` per line);
+comments are fine. JSON works too. Before any lane runs, the `plan` job
+checks every lane: an unknown key (`verify_model`), a missing one, a
+repeated name, half a backup, a check or provider that is not in your
+directories. Each one stops the run, with the error shown on it.
 
 ## How a run goes
 

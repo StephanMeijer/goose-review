@@ -388,6 +388,188 @@ def selected_checks() -> list[Check]:
     return [c for c in checks if c.name in CONFIG.only_checks]
 
 
+# --- lanes ------------------------------------------------------------------
+#
+# The caller's lanes, as YAML (or JSON, which is YAML too) in one workflow
+# input: a list of flat mappings whose values are scalars or lists of
+# scalars. Only that much YAML is read, by hand, so the engine stays
+# standard-library only and runs on any runner; anything else is an error
+# naming its line, as is a key no lane has.
+
+LANE_REQUIRED = ("lane", "provider", "model", "verify-provider", "verify-model")
+LANE_OPTIONAL = ("verify-backup-provider", "verify-backup-model", "checks", "jobs")
+LANE_NAME_RE = re.compile(r"[a-z0-9-]+")
+
+
+class LanesError(ValueError):
+    pass
+
+
+def yaml_scalar(text: str, where: str) -> str | list[str]:
+    """A plain, single- or double-quoted scalar, or a flow list of them."""
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        return [str(yaml_scalar(item, where)) for item in inner.split(",")] if inner else []
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        return text[1:-1]
+    if text[:1] in "[{&*!|>%@`" or text.startswith(("'", '"')):
+        raise LanesError(f"{where}: not a plain value, quoted string or [list]: {text}")
+    return text
+
+
+def strip_comment(line: str) -> str:
+    """The line without a `#` comment (one at the start or after a space,
+    outside quotes)."""
+    quote = ""
+    for i, ch in enumerate(line):
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i]
+    return line
+
+
+def parse_lanes(text: str) -> list[dict]:
+    """The lanes in `text`: JSON, or a YAML block list of mappings."""
+    if text.lstrip().startswith("["):
+        try:
+            data = json.loads(text)
+        except ValueError as error:
+            raise LanesError(f"lanes: not valid JSON: {error}")
+        if not isinstance(data, list) or not all(isinstance(lane, dict) for lane in data):
+            raise LanesError("lanes: must be a list of mappings")
+        return data
+    lanes: list[dict] = []
+    item_indent = key_indent = None
+    list_key = None
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = strip_comment(raw.replace("\t", "    ")).rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        body = line.strip()
+        where = f"lanes, line {n}"
+        if body == "-" or body.startswith("- "):
+            if item_indent is None or indent == item_indent:
+                # A new lane; its first key may share the line.
+                item_indent = indent
+                lanes.append({})
+                list_key = None
+                rest = body[1:].strip()
+                if not rest:
+                    key_indent = None
+                    continue
+                key_indent = indent + (len(body) - len(rest))
+                body, indent = rest, key_indent
+            elif list_key is not None and indent >= (key_indent or 0):
+                # A block list's items may sit at its key's indentation.
+                lanes[-1][list_key].append(str(yaml_scalar(body[1:], where)))
+                continue
+            else:
+                raise LanesError(f"{where}: a list item here belongs to no key")
+        if not lanes:
+            raise LanesError(f"{where}: lanes must be a list: start each lane with `- `")
+        key_indent = indent if key_indent is None else key_indent
+        if indent != key_indent:
+            raise LanesError(f"{where}: indented unlike the lane's other keys")
+        key, sep, value = body.partition(":")
+        # Any key-shaped name: validate_lanes names the ones no lane has.
+        if not sep or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", key.strip()):
+            raise LanesError(f"{where}: expected `key: value`, got: {body}")
+        key = key.strip()
+        if key in lanes[-1]:
+            raise LanesError(f"{where}: `{key}` given twice in one lane")
+        if value.strip():
+            lanes[-1][key] = yaml_scalar(value, where)
+            list_key = None
+        else:
+            lanes[-1][key] = []
+            list_key = key
+    return lanes
+
+
+def validate_lanes(lanes: list[dict], checks: list[str] | None = None,
+                   providers: list[str] | None = None) -> list[dict]:
+    """Every lane complete and well-formed, normalised for the matrix: all
+    keys present, `checks` a list and `jobs` a number. With the names of
+    the caller's checks and provider templates, those are checked too."""
+    if not lanes:
+        raise LanesError("lanes: no lane given")
+    out, names, problems = [], set(), []
+    for i, lane in enumerate(lanes, 1):
+        label = f"lane {i}" + (f" ({lane['lane']})" if isinstance(lane.get("lane"), str) else "")
+        unknown = sorted(set(lane) - set(LANE_REQUIRED) - set(LANE_OPTIONAL))
+        if unknown:
+            problems.append(f"{label}: unknown key(s) {', '.join(unknown)}; a lane has "
+                            f"{', '.join(LANE_REQUIRED + LANE_OPTIONAL)}")
+        missing = [k for k in LANE_REQUIRED if not isinstance(lane.get(k), str) or not lane[k].strip()]
+        if missing:
+            problems.append(f"{label}: missing {', '.join(missing)}")
+            continue
+        name = lane["lane"]
+        if not LANE_NAME_RE.fullmatch(name) or name == "summary":
+            problems.append(f"{label}: the name must be [a-z0-9-]+ and not `summary`")
+        if name in names:
+            problems.append(f"{label}: the name `{name}` is used twice")
+        names.add(name)
+        backup = [lane.get(k) or "" for k in ("verify-backup-provider", "verify-backup-model")]
+        if bool(backup[0]) != bool(backup[1]):
+            problems.append(f"{label}: give both verify-backup-provider and verify-backup-model, or neither")
+        raw_checks = lane.get("checks") or []
+        names_of_checks = raw_checks.replace(",", " ").split() if isinstance(raw_checks, str) else [str(c) for c in raw_checks]
+        if checks is not None:
+            unknown_checks = sorted(set(names_of_checks) - set(checks))
+            if unknown_checks:
+                problems.append(f"{label}: no such check {', '.join(unknown_checks)} (there are {', '.join(checks)})")
+        try:
+            jobs = int(lane.get("jobs", 2))
+            if not 1 <= jobs <= 16:
+                raise ValueError
+        except (TypeError, ValueError):
+            problems.append(f"{label}: jobs must be a number from 1 to 16")
+            jobs = 2
+        if providers is not None:
+            for key in ("provider", "verify-provider", "verify-backup-provider"):
+                if lane.get(key) and lane[key] not in providers:
+                    problems.append(f"{label}: {key} `{lane[key]}` has no template (there are {', '.join(providers)})")
+        out.append({
+            **{k: lane[k].strip() for k in LANE_REQUIRED},
+            "verify-backup-provider": backup[0], "verify-backup-model": backup[1],
+            "checks": names_of_checks, "jobs": jobs,
+        })
+    if problems:
+        raise LanesError("\n".join(problems))
+    return out
+
+
+def cmd_lanes(args: argparse.Namespace) -> None:
+    """Read the caller's lanes (YAML or JSON) from $GOOSE_REVIEW_LANES,
+    check them against the checks and provider templates, and write them
+    as JSON for the lane matrix: to $GITHUB_OUTPUT as `lanes`, or stdout."""
+    checks_dir, providers_dir = Path(args.checks_dir), Path(args.providers_dir)
+    checks = [c.name for c in load_checks(checks_dir)] if checks_dir.is_dir() else None
+    providers = sorted(p.stem for p in providers_dir.glob("*.json")) if providers_dir.is_dir() else None
+    try:
+        lanes = validate_lanes(parse_lanes(os.environ.get("GOOSE_REVIEW_LANES", "")), checks, providers)
+    except LanesError as error:
+        for line in str(error).splitlines():
+            print(f"::error::{line}", file=sys.stderr)
+        raise SystemExit(1)
+    text = json.dumps(lanes, separators=(",", ":"))
+    for lane in lanes:
+        verify = lane["verify-model"] + (f", backup {lane['verify-backup-model']}" if lane["verify-backup-model"] else "")
+        print(f"lane {lane['lane']}: {lane['model']} reviews, {verify} verifies"
+              + (f"; checks {', '.join(lane['checks'])}" if lane["checks"] else ""), file=sys.stderr)
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"lanes={text}\n")
+    else:
+        print(text)
+
+
 def configure(args: argparse.Namespace) -> None:
     """Set CONFIG from the review and verify steps' shared options."""
     global CONFIG
@@ -2422,6 +2604,11 @@ def main() -> None:
         p.add_argument("--tools-file", help="appended to the tools prompt: the project's own commands")
         p.add_argument("--rules-file", help="replaces the rules added to every check's and the verifier's prompt")
     verify.set_defaults(func=cmd_verify)
+
+    lanes = sub.add_parser("lanes", help="read, check and normalise the lanes in $GOOSE_REVIEW_LANES (YAML or JSON)")
+    lanes.add_argument("--checks-dir", default=".agents/checks", help="to check each lane's check names; skipped when missing")
+    lanes.add_argument("--providers-dir", default=".github/goose/providers", help="to check each lane's providers; skipped when missing")
+    lanes.set_defaults(func=cmd_lanes)
 
     ans = sub.add_parser("answered", help="write the pull request's answered lane findings, for `verify`")
     ans.add_argument("--repo", required=True, help="owner/name")

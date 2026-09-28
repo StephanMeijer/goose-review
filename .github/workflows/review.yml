@@ -7,7 +7,12 @@
 #     goose-review:
 #       uses: StephanMeijer/goose-review/.github/workflows/review.yml@<sha>
 #       with:
-#         lanes: '[{"lane": "a", "provider": ..., "model": ..., "verify-provider": ..., "verify-model": ...}]'
+#         lanes: |
+#           - lane: a
+#             provider: ...
+#             model: ...
+#             verify-provider: ...
+#             verify-model: ...
 #         egress-endpoints: '["llm-proxy.example.com:443"]'
 #       secrets:
 #         PROVIDER_ROUTES: ${{ secrets.MY_ROUTES }}
@@ -24,9 +29,11 @@ on:
     inputs:
       lanes:
         description: >-
-          JSON list of lanes: {lane, provider, model, verify-provider,
-          verify-model, verify-backup-provider?, verify-backup-model?,
-          checks? (list of check names), jobs? (checks at once, default 2)}.
+          The lanes, as YAML (a list of mappings) or JSON. Each: lane,
+          provider, model, verify-provider, verify-model, and optionally
+          verify-backup-provider and verify-backup-model, checks (a list of
+          check names) and jobs (checks at once, default 2). Checked before
+          any lane runs; see the README.
         type: string
         required: true
       checks-dir:
@@ -92,10 +99,43 @@ on:
 permissions: {}
 
 jobs:
-  # First, in seconds: collapse the review's own resolved threads, and mark
+  # First, in seconds: read and check the lanes against the checks and
+  # provider templates. A mistake in them stops the run here, with the
+  # errors on the run's page, before anything is posted.
+  plan:
+    name: plan
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      lanes: ${{ steps.lanes.outputs.lanes }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: |
+            ${{ inputs.checks-dir }}
+            ${{ inputs.providers-dir }}
+          persist-credentials: false
+      - id: lanes
+        uses: StephanMeijer/goose-review/lanes@0000000000000000000000000000000000000000
+        with:
+          lanes: ${{ inputs.lanes }}
+          checks-dir: ${{ inputs.checks-dir }}
+          providers-dir: ${{ inputs.providers-dir }}
+
+  # Then, in seconds: collapse the review's own resolved threads, and mark
   # this run as running in the summary comment.
   tidy:
     name: tidy
+    needs: plan
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
     permissions:
@@ -113,10 +153,11 @@ jobs:
 
   lanes:
     name: ${{ matrix.lane }}
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.lanes) }}
+        include: ${{ fromJSON(needs.plan.outputs.lanes) }}
     # The most the lane's jobs use: review reads, post writes the review.
     permissions:
       contents: read
@@ -128,10 +169,10 @@ jobs:
       model: ${{ matrix.model }}
       verify-provider: ${{ matrix['verify-provider'] }}
       verify-model: ${{ matrix['verify-model'] }}
-      verify-backup-provider: ${{ matrix['verify-backup-provider'] || '' }}
-      verify-backup-model: ${{ matrix['verify-backup-model'] || '' }}
-      checks: ${{ matrix.checks && join(matrix.checks, ' ') || '' }}
-      jobs: ${{ matrix.jobs || 2 }}
+      verify-backup-provider: ${{ matrix['verify-backup-provider'] }}
+      verify-backup-model: ${{ matrix['verify-backup-model'] }}
+      checks: ${{ join(matrix.checks, ' ') }}
+      jobs: ${{ matrix.jobs }}
       checks-dir: ${{ inputs.checks-dir }}
       facts-dir: ${{ inputs.facts-dir }}
       providers-dir: ${{ inputs.providers-dir }}

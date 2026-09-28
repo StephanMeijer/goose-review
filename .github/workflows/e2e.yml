@@ -36,13 +36,21 @@ jobs:
       issues: write
       pull-requests: write
     with:
-      lanes: >-
-        [{"lane": "alpha", "provider": "routed", "model": "fake-a",
-          "verify-provider": "direct", "verify-model": "fake-verifier"},
-         {"lane": "beta", "provider": "direct", "model": "fake-b",
-          "verify-provider": "direct", "verify-model": "fake-empty",
-          "verify-backup-provider": "direct", "verify-backup-model": "fake-backup",
-          "checks": ["planted"]}]
+      lanes: |
+        - lane: alpha
+          provider: routed
+          model: fake-a
+          verify-provider: direct
+          verify-model: fake-verifier
+
+        - lane: beta
+          provider: direct
+          model: fake-b              # slow: posts into alpha's open thread
+          verify-provider: direct
+          verify-model: fake-empty   # answers empty: its backup verifies
+          verify-backup-provider: direct
+          verify-backup-model: fake-backup
+          checks: [planted]
       checks-dir: tests/e2e/checks
       facts-dir: tests/e2e/facts
       providers-dir: tests/e2e/providers

@@ -1,0 +1,37 @@
+name: Goose review - lanes
+description: >-
+  Reads the caller's lanes -- YAML (a list of mappings) or JSON -- checks
+  them against the checks and provider templates in the checkout, and
+  outputs them as JSON for a lane matrix. A mistyped key, a missing model,
+  an unknown check or provider is an error here, before any lane runs.
+author: Stephan Meijer
+
+inputs:
+  lanes:
+    description: The lanes, as YAML or JSON. See the README.
+    required: true
+  checks-dir:
+    description: Directory of the check files, to check each lane's `checks`. Skipped when missing.
+    default: .agents/checks
+  providers-dir:
+    description: Directory of the provider templates, to check each lane's providers. Skipped when missing.
+    default: .github/goose/providers
+
+outputs:
+  lanes:
+    description: The lanes as a JSON list, every key present (`checks` a list, `jobs` a number).
+    value: ${{ steps.read.outputs.lanes }}
+
+runs:
+  using: composite
+  steps:
+    - id: read
+      name: Read the lanes
+      shell: bash
+      env:
+        GOOSE_REVIEW_LANES: ${{ inputs.lanes }}
+        CHECKS_DIR: ${{ inputs.checks-dir }}
+        PROVIDERS_DIR: ${{ inputs.providers-dir }}
+      run: >
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" lanes
+        --checks-dir "$CHECKS_DIR" --providers-dir "$PROVIDERS_DIR"

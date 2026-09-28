@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- `lanes` may be YAML: a list of mappings, one key per line, with comments.
+  JSON still works.
+- A `plan` job (the new `lanes` action) checks the lanes before any lane
+  runs, and stops the run with the errors shown: an unknown or missing key,
+  a bad or repeated name, half a backup verifier, `jobs` out of range, a
+  check or provider template that does not exist.
+
 ## 0.2.0
 
 - **Breaking:** the workflow's `egress-endpoints` is a JSON list

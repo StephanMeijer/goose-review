@@ -10,6 +10,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 sha=$(git rev-parse --verify "${1:-HEAD}^{commit}")
-sed -i -E "s#(uses: StephanMeijer/goose-review/(review|post|tidy|summary))@[0-9a-f]{40}#\\1@$sha#" \
+sed -i -E "s#(uses: StephanMeijer/goose-review/(lanes|review|post|tidy|summary))@[0-9a-f]{40}#\\1@$sha#" \
   .github/workflows/review.yml .github/workflows/lane.yml
 grep -c "StephanMeijer/goose-review/.*@$sha" .github/workflows/review.yml .github/workflows/lane.yml
