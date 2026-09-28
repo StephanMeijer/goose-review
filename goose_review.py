@@ -2336,11 +2336,17 @@ LEGACY_HISTORY_RE = re.compile(r"<!-- goose-review:history ([A-Za-z0-9+/=]*) -->
 
 
 def job_lane(name: str) -> tuple[str, str]:
-    """(lane, kind) from a lane job's name: its last two ` / ` parts, so both
-    `deepseek / review` (a caller's own lane workflow) and `review / lanes /
-    deepseek / review` (nested in the reusable workflow) match."""
+    """(lane, kind) from a lane job's name, its last two ` / ` parts: both
+    `deepseek / review` (a caller's own lane workflow) and `goose-review /
+    3 deepseek / review → post` (nested in the reusable workflow, numbered
+    by stage so it sorts in run order) match. `post` may be named `review →
+    post`; the lane may carry a stage number."""
     parts = name.split(" / ")
-    return (parts[-2], parts[-1]) if len(parts) >= 2 else ("", "")
+    if len(parts) < 2:
+        return "", ""
+    lane = re.sub(r"^\d+\s+", "", parts[-2])
+    kind = "post" if parts[-1].endswith("post") else parts[-1]
+    return lane, kind
 
 
 def cmd_summary(args: argparse.Namespace) -> None:

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1
+
+- The pre-composed workflow's jobs are numbered by stage (`1 plan`, `2 tidy`,
+  `3 <lane> / review`, `3 <lane> / review → post`, `4 summary`), so a checks
+  list sorted by name shows them in the order they run. The summary reads
+  both these names and the plain ones of a hand-wired caller.
+
 ## 0.3.0
 
 - `lanes` may be YAML: a list of mappings, one key per line, with comments.

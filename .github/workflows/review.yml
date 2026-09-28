@@ -102,8 +102,10 @@ jobs:
   # First, in seconds: read and check the lanes against the checks and
   # provider templates. A mistake in them stops the run here, with the
   # errors on the run's page, before anything is posted.
+  # The names are numbered by stage, so a checks list sorted by name shows
+  # the jobs in the order they run (the lanes run side by side, all `3`).
   plan:
-    name: plan
+    name: 1 plan
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
     permissions:
@@ -134,7 +136,7 @@ jobs:
   # Then, in seconds: collapse the review's own resolved threads, and mark
   # this run as running in the summary comment.
   tidy:
-    name: tidy
+    name: 2 tidy
     needs: plan
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
@@ -152,7 +154,7 @@ jobs:
       - uses: StephanMeijer/goose-review/tidy@1d200df31d77b2f97d9e099960945d27a23e4edf
 
   lanes:
-    name: ${{ matrix.lane }}
+    name: 3 ${{ matrix.lane }}
     needs: plan
     strategy:
       fail-fast: false
@@ -193,7 +195,7 @@ jobs:
   # Last: one comment for the pull request, after tidy (whose "running"
   # entry it replaces) and every lane.
   summary:
-    name: summary
+    name: 4 summary
     needs: [tidy, lanes]
     if: ${{ !cancelled() && needs.lanes.result != 'skipped' }}
     runs-on: ${{ inputs.runs-on }}

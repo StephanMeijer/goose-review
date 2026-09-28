@@ -197,6 +197,9 @@ class GitHubEndpoints(unittest.TestCase):
         self.assertEqual(g.job_lane("deepseek / review"), ("deepseek", "review"))
         self.assertEqual(g.job_lane("goose-review / lanes / deepseek / post"), ("deepseek", "post"))
         self.assertEqual(g.job_lane("tidy"), ("", ""))
+        self.assertEqual(g.job_lane("goose-review / 3 deepseek / review"), ("deepseek", "review"))
+        self.assertEqual(g.job_lane("goose-review / 3 deepseek / review → post"), ("deepseek", "post"))
+        self.assertNotIn(g.job_lane("goose-review / 2 tidy")[1], ("review", "post"))
 
 
 class Providers(unittest.TestCase):
