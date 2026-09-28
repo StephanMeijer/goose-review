@@ -33,7 +33,7 @@ jobs:
           allowed-endpoints: >
             github.com:443
             api.github.com:443
-      - uses: StephanMeijer/goose-review/tidy@8bafeeb4a14b752ffaa464998634384870011d1b # v0.3.0
+      - uses: StephanMeijer/goose-review/tidy@fffed4c7e263c566b08762ebf03456fa1d20b845 # v0.3.1
 
   lane:
     name: ${{ matrix.lane }}
@@ -109,4 +109,4 @@ jobs:
             productionresultssa17.blob.core.windows.net:443
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
-      - uses: StephanMeijer/goose-review/summary@8bafeeb4a14b752ffaa464998634384870011d1b # v0.3.0
+      - uses: StephanMeijer/goose-review/summary@fffed4c7e263c566b08762ebf03456fa1d20b845 # v0.3.1
