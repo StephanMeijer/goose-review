@@ -44,7 +44,7 @@ permissions: {}
 jobs:
   goose-review:
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
-    uses: StephanMeijer/goose-review/.github/workflows/review.yml@0000000000000000000000000000000000000000 # vX.Y.Z
+    uses: StephanMeijer/goose-review/.github/workflows/review.yml@d4e61dd3ca66e7422e2d6a7b0d8efc5c4465ac45 # v0.1.0
     permissions: { contents: read, actions: read, issues: write, pull-requests: write }
     with:
       lanes: >-
