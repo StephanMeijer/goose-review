@@ -113,7 +113,7 @@ jobs:
           SETUP: ${{ inputs.setup }}
         run: bash -euo pipefail -c "$SETUP"
 
-      - uses: StephanMeijer/goose-review/review@2e4ee17c571db5aa396d0c398fcf75c334e96c17
+      - uses: StephanMeijer/goose-review/review@1d200df31d77b2f97d9e099960945d27a23e4edf
         with:
           lane: ${{ inputs.lane }}
           provider: ${{ inputs.provider }}
@@ -176,7 +176,7 @@ jobs:
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
 
-      - uses: StephanMeijer/goose-review/post@2e4ee17c571db5aa396d0c398fcf75c334e96c17
+      - uses: StephanMeijer/goose-review/post@1d200df31d77b2f97d9e099960945d27a23e4edf
         with:
           lane: ${{ inputs.lane }}
           model: ${{ inputs.model }}

@@ -125,7 +125,7 @@ jobs:
             ${{ inputs.providers-dir }}
           persist-credentials: false
       - id: lanes
-        uses: StephanMeijer/goose-review/lanes@0000000000000000000000000000000000000000
+        uses: StephanMeijer/goose-review/lanes@1d200df31d77b2f97d9e099960945d27a23e4edf
         with:
           lanes: ${{ inputs.lanes }}
           checks-dir: ${{ inputs.checks-dir }}
@@ -149,7 +149,7 @@ jobs:
           allowed-endpoints: >
             github.com:443
             api.github.com:443
-      - uses: StephanMeijer/goose-review/tidy@2e4ee17c571db5aa396d0c398fcf75c334e96c17
+      - uses: StephanMeijer/goose-review/tidy@1d200df31d77b2f97d9e099960945d27a23e4edf
 
   lanes:
     name: ${{ matrix.lane }}
@@ -231,4 +231,4 @@ jobs:
             productionresultssa17.blob.core.windows.net:443
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
-      - uses: StephanMeijer/goose-review/summary@2e4ee17c571db5aa396d0c398fcf75c334e96c17
+      - uses: StephanMeijer/goose-review/summary@1d200df31d77b2f97d9e099960945d27a23e4edf
