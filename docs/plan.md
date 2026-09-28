@@ -86,7 +86,7 @@ Provider-specific preflights such as NotedThat's OpenRouter credit check (lane.y
 
 The same-repo/draft/release gate and the concurrency group (`cancel-in-progress: false`) stay in the caller, and the example shows them.
 
-## Repo layout (new, public, MIT)
+## Repo layout (new, public, MPL-2.0)
 
 ```
 .github/workflows/review.yml   pre-composed reusable workflow (entry point)
@@ -166,7 +166,7 @@ Covers:
 
 ## Order of work
 
-1. Create the repo with `gh repo create StephanMeijer/goose-review --public` (MIT), working locally under `~/Projects/github.com/StephanMeijer/goose-review`.
+1. Create the repo with `gh repo create StephanMeijer/goose-review --public` (MPL-2.0, like NotedThat), working locally under `~/Projects/github.com/StephanMeijer/goose-review`.
 2. Copy the engine, tests and render script from NotedThat `main` (`9ea74f7`), confirm the ported tests pass unchanged, then make the engine changes with tests.
 3. The four composite actions.
 4. `review.yml`, `lane.yml`, `scripts/release.sh` and the internal-ref check.

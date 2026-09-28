@@ -232,4 +232,4 @@ Set `GOOSE_REVIEW_LOG_DIR` to keep every run's full transcript.
   `scripts/pin.sh` and commit the pin.
 - To release: `scripts/release.sh X.Y.Z`.
 
-MIT licensed.
+Licensed under the Mozilla Public License 2.0 (see LICENSE), like NotedThat, where it began.
