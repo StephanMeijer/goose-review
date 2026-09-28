@@ -4,7 +4,8 @@
 # `beta` through a direct one, slower (it posts into alpha's open thread)
 # and verified by its backup (its verifier answers empty). `assert` then
 # reads the pull request back. The branch e2e/fixture adds the planted
-# line; on other pull requests the check has nothing to review, and only
+# line; on other pull requests (while this repository does not review
+# itself, see goose-review.yml) the check has nothing to review, and only
 # the summary is asserted.
 name: End-to-end
 
@@ -20,11 +21,14 @@ permissions: {}
 
 jobs:
   goose-review:
-    # The hand-wired variant has its own branch (e2e-hand-wired.yml): two
-    # runs on one pull request would share its summary comment.
+    # One review run per pull request, as they share its summary comment:
+    # the hand-wired variant has its own branch (e2e-hand-wired.yml), and
+    # while this repository reviews itself with real models
+    # (goose-review.yml), this runs on the fixture branch only.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository
       && github.head_ref != 'e2e/hand-wired'
+      && (github.head_ref == 'e2e/fixture' || vars.GOOSE_REVIEW_ENABLED != 'true')
     uses: ./.github/workflows/review.yml
     permissions:
       contents: read

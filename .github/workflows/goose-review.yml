@@ -1,0 +1,56 @@
+# goose-review reviewing its own pull requests, with real models, through
+# its own pre-composed workflow at the pull request's commit. It needs the
+# proxy secrets and is off until the repository variable
+# GOOSE_REVIEW_ENABLED is `true`:
+#
+#   secrets    GOOSE_PROXY_TOKEN, GOOSE_THIRDPARTY_BASE_URL, GOOSE_MINIMAX_BASE_URL
+#   variables  GOOSE_PROXY_EGRESS (the proxy's host:port), GOOSE_REVIEW_ENABLED
+#
+# The fixture branches (e2e/*) are the end-to-end tests' own: one review run
+# per pull request, as they share its summary comment.
+name: Goose review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: goose-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  goose-review:
+    if: >-
+      vars.GOOSE_REVIEW_ENABLED == 'true'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && !github.event.pull_request.draft
+      && !startsWith(github.head_ref, 'e2e/')
+    uses: ./.github/workflows/review.yml
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    with:
+      lanes: >-
+        [{"lane": "deepseek", "provider": "thirdparty", "model": "deepseek-v4-flash-0731",
+          "verify-provider": "minimax", "verify-model": "MiniMax-M3",
+          "verify-backup-provider": "thirdparty", "verify-backup-model": "deepseek-v4-flash-0731"},
+         {"lane": "minimax", "provider": "minimax", "model": "MiniMax-M3",
+          "verify-provider": "thirdparty", "verify-model": "deepseek-v4-flash-0731",
+          "verify-backup-provider": "minimax", "verify-backup-model": "MiniMax-M3", "jobs": 3},
+         {"lane": "mistral", "provider": "thirdparty", "model": "mistral-medium-3-5",
+          "verify-provider": "minimax", "verify-model": "MiniMax-M3",
+          "verify-backup-provider": "thirdparty", "verify-backup-model": "deepseek-v4-flash-0731"}]
+      egress-endpoints: ${{ vars.GOOSE_PROXY_EGRESS }}
+      ignore: |
+        CHANGELOG.md
+        docs/plan.md
+    secrets:
+      PROVIDER_ROUTES: |
+        thirdparty=${{ secrets.GOOSE_THIRDPARTY_BASE_URL }}
+        minimax=${{ secrets.GOOSE_MINIMAX_BASE_URL }}
+      PROVIDER_ENV: |
+        GOOSE_PROXY_TOKEN=${{ secrets.GOOSE_PROXY_TOKEN }}

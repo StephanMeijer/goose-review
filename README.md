@@ -228,6 +228,10 @@ Set `GOOSE_REVIEW_LOG_DIR` to keep every run's full transcript.
   `scripts/check-pins.sh`.
 - `e2e.yml` and `e2e-hand-wired.yml` run both layers on the fixture pull
   requests (#1, #2) and read them back.
+- `goose-review.yml` reviews this repository's own pull requests with real
+  models through its own `review.yml`, once the proxy secrets and the
+  variable `GOOSE_REVIEW_ENABLED=true` are set. The fake-Goose e2e then runs
+  on the fixture branches only.
 - After changing the actions or the engine, commit, then run
   `scripts/pin.sh` and commit the pin.
 - To release: `scripts/release.sh X.Y.Z`.
