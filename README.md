@@ -50,8 +50,7 @@ jobs:
       lanes: >-
         [{"lane": "deepseek", "provider": "my_proxy", "model": "deepseek-v4-flash",
           "verify-provider": "my_proxy", "verify-model": "MiniMax-M3"}]
-      egress-endpoints: |
-        llm-proxy.example.com:443
+      egress-endpoints: '["llm-proxy.example.com:443"]'
     secrets:
       PROVIDER_ROUTES: ${{ secrets.GOOSE_REVIEW_ROUTES }}
       PROVIDER_ENV: ${{ secrets.GOOSE_REVIEW_PROVIDER_ENV }}
@@ -68,7 +67,7 @@ Inputs:
 - Directories: `checks-dir`, `facts-dir`, `providers-dir`.
 - Prompt and diff: `ignore`, `tools-file`, `rules-file`.
 - Time budgets: `budget-minutes` (35) and `verify-budget-minutes` (12).
-- The review job: `egress-endpoints` (hosts it may reach beyond GitHub),
+- The review job: `egress-endpoints` (a JSON list of the hosts it may reach beyond GitHub; the allow-list splits on single spaces),
   `setup` (your preparation, e.g. `cargo fetch --locked`), `runs-on`,
   `review-timeout-minutes` (60).
 

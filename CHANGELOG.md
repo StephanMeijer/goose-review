@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0
+
+- **Breaking:** the workflow's `egress-endpoints` is a JSON list
+  (`'["llm-proxy.example.com:443"]'`). harden-runner's agent splits its
+  allow-list on single spaces, so the entries 0.1.0 took one per line
+  arrived as one broken entry and the review job could reach none of them
+  (on NotedThat, `cargo fetch` hung). The end-to-end test now lists a real
+  host and fetches from it.
+
 ## 0.1.0
 
 The Goose review from NotedThat (PR #207, main at 9ea74f7), extracted and

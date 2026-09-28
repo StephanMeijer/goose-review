@@ -47,6 +47,10 @@ jobs:
       facts-dir: tests/e2e/facts
       providers-dir: tests/e2e/providers
       setup: bash tests/e2e/setup.sh
+      # One real host beyond GitHub, which setup.sh fetches from: proves the
+      # caller's entries reach the review job's allow-list intact (v0.1.0
+      # broke them when they came as lines).
+      egress-endpoints: '["index.crates.io:443", "static.crates.io:443"]'
       install-goose: false
       review-timeout-minutes: 20
     secrets:

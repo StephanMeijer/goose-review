@@ -61,6 +61,8 @@ jobs:
           persist-credentials: false
 
       - name: Set up the fakes
+        env:
+          E2E_EGRESS_PROBE: "false"
         run: bash tests/e2e/setup.sh
 
       - uses: ./review

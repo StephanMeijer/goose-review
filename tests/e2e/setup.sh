@@ -12,6 +12,11 @@ echo '{"data": []}' > "$fake/www/r1/models"
 nohup python3 -m http.server 8765 --bind 127.0.0.1 --directory "$fake/www" >/dev/null 2>&1 &
 for _ in $(seq 20); do curl -sf http://127.0.0.1:8765/v1/models >/dev/null && break; sleep 0.5; done
 echo "$fake/bin" >> "$GITHUB_PATH"
+# A host allowed only through the caller's egress-endpoints: blocked, this
+# fails the review job, and with it the end-to-end assertions.
+if [ "${E2E_EGRESS_PROBE:-true}" = true ]; then
+  curl -sSf --max-time 20 -o /dev/null https://index.crates.io/config.json
+fi
 {
   echo "FAKE_GOOSE_EMPTY_MODELS=fake-empty"
   echo "FAKE_GOOSE_SLOW_MODELS=fake-b"

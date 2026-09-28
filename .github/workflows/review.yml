@@ -8,6 +8,7 @@
 #       uses: StephanMeijer/goose-review/.github/workflows/review.yml@<sha>
 #       with:
 #         lanes: '[{"lane": "a", "provider": ..., "model": ..., "verify-provider": ..., "verify-model": ...}]'
+#         egress-endpoints: '["llm-proxy.example.com:443"]'
 #       secrets:
 #         PROVIDER_ROUTES: ${{ secrets.MY_ROUTES }}
 #         PROVIDER_ENV: ${{ secrets.MY_PROVIDER_ENV }}
@@ -57,11 +58,12 @@ on:
         default: 12
       egress-endpoints:
         description: >-
-          Further host:port entries the review job may reach, one per line:
+          JSON list of further host:port entries the review job may reach:
           the providers' hosts (or your egress proxy's), and whatever
-          `setup` downloads from.
+          `setup` downloads from. A list, not lines: harden-runner splits
+          its allow-list on single spaces only.
         type: string
-        default: ""
+        default: "[]"
       setup:
         description: >-
           Shell commands run in the review job after the checkout, before any

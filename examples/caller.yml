@@ -40,12 +40,12 @@ jobs:
           "verify-provider": "my_proxy", "verify-model": "deepseek-v4-flash",
           "checks": ["security", "correctness"]}]
       # The hosts your providers (or your egress proxy) are on, and what
-      # `setup` downloads from; the review job can reach nothing else.
-      egress-endpoints: |
-        llm-proxy.example.com:443
+      # `setup` downloads from; the review job can reach nothing else. A JSON
+      # list: harden-runner splits its allow-list on single spaces.
+      egress-endpoints: '["llm-proxy.example.com:443"]'
       # Your own preparation, before any secret or model runs. For Rust:
       #   setup: cargo fetch --locked
-      # with index.crates.io:443 and static.crates.io:443 in egress-endpoints.
+      # with "index.crates.io:443" and "static.crates.io:443" in egress-endpoints.
       ignore: |
         **/Cargo.lock
         **/CHANGELOG.md

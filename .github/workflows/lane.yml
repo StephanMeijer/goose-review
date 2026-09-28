@@ -31,7 +31,7 @@ on:
       rules-file: { type: string, default: "" }
       budget-minutes: { type: number, default: 35 }
       verify-budget-minutes: { type: number, default: 12 }
-      egress-endpoints: { type: string, default: "" }
+      egress-endpoints: { type: string, default: "[]" }
       setup: { type: string, default: "" }
       runs-on: { type: string, default: ubuntu-latest }
       review-timeout-minutes: { type: number, default: 60 }
@@ -59,7 +59,9 @@ jobs:
       # Read-only, for the answered findings; only that step holds the token.
       pull-requests: read
     steps:
-      # Everything after this step can reach only the endpoints listed. The
+      # Everything after this step can reach only the endpoints listed; the
+      # agent splits the list on single spaces, so the caller's entries are
+      # joined with exactly that. The
       # model has a shell here, so sudo goes too: with it, the model could
       # lift the policy. Artifact storage is GitHub's own accounts by name,
       # not *.blob.core.windows.net, where anyone can create an account.
@@ -93,7 +95,7 @@ jobs:
             productionresultssa17.blob.core.windows.net:443
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
-            ${{ inputs.egress-endpoints }}
+            ${{ join(fromJSON(inputs.egress-endpoints), ' ') }}
 
       # The PR head itself, not the merge commit: review comments are
       # anchored to the head's line numbers.
