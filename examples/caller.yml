@@ -23,7 +23,7 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository
       && !github.event.pull_request.draft
-    uses: StephanMeijer/goose-review/.github/workflows/review.yml@fffed4c7e263c566b08762ebf03456fa1d20b845 # v0.3.1
+    uses: StephanMeijer/goose-review/.github/workflows/review.yml@583a38a2ee99a7f01f76f39a81b9cd84076fadee # v0.3.2
     permissions:
       contents: read
       actions: read
