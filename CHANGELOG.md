@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+- **Breaking:** a run is three jobs, whatever the number of lanes: `plan`
+  (check the lanes, collapse resolved threads, mark the run running),
+  `review` (every lane at once, in one job) and `post` (one review with
+  every lane's findings, then the summary comment). The lane matrix,
+  `lane.yml` and the separate `tidy` and `summary` jobs are gone.
+- **Breaking (hand-wired callers):** the `review` and `post` actions take
+  `lanes` (the same YAML or JSON as the workflow, or the `lanes` action's
+  output) instead of one lane's inputs, and `post` writes the summary: the
+  `summary` action is gone. `tidy` runs in the plan job.
+  See [`examples/hand-wired/`](examples/hand-wired/).
+- One review per run instead of one per lane: each comment is still signed
+  with its lane's models, and findings of several lanes on the same lines
+  share one thread (the most severe opens it, the others reply).
+- A lane whose provider does not answer stops alone; the other lanes carry
+  on in the same job.
+- The review's artifact is one, `goose-review`, with a directory per lane.
+
 ## 0.4.0
 
 - `tools`: install your own tools in the review job and tell the model it
