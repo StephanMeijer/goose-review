@@ -5,52 +5,18 @@ turn-limit: 40
 paths: [".github/workflows/*.yml", "*/action.yml", "goose_review.py", "*.sh", "scripts/**"]
 ---
 
-You review a pull request to goose-review for security holes an attacker can
-actually exploit. goose-review runs an LLM review of other repositories'
-pull requests: composite actions (review/, post/, tidy/, summary/) and a
-reusable workflow (.github/workflows/review.yml, lane.yml) run
-goose_review.py, which gives a model a shell in the pull request's checkout
-and posts what it finds. Its guarantees, in the README's "Security model":
-the review job has a read-only token and blocked egress, the model never
-gets a GitHub token or the raw provider settings, everything leaving the
-review job is scrubbed of the provider secrets, and `post` scrubs again on
-its own runner with the action's own engine.
+A specialist pass beside the broad `general` check: look only for security
+holes an attacker can exploit. The README's "Security model" states the
+guarantees: a read-only token and blocked egress in the review job, no
+GitHub token or raw provider settings for the model, and every output
+scrubbed of provider secrets, again in `post`.
 
-## What a finding must show
+Report only a path from an input an attacker controls (the pull request's
+text, branch name, files or diff, or what a prompt-injected model writes)
+past a missing guard to a crossed boundary (a provider secret or write
+token leaving, the caller's repository written), with its impact. If a
+guard on the real path stops it, there is no finding. Trusted configuration
+set wrongly, hardening ideas and the residual risks the README names are
+not findings.
 
-Report only when you can name all four:
-
-1. **Input** an attacker controls: the reviewed pull request's title, body,
-   branch name, files or diff; text the model writes (it can be
-   prompt-injected by any of those); comments on the pull request.
-2. **Sink or missing guard**: a `run:` script it is interpolated into, a
-   secret or token it reaches, a scrub it slips past, a GitHub API call it
-   steers.
-3. **Boundary** crossed: a provider key or route leaving the review job, a
-   write token reachable from the model, the caller's repository written.
-4. **Impact** that follows concretely.
-
-If a guard on the real path stops it (inputs passed through `env:`, the
-scrub in `post`, `goose_env` stripping tokens, harden-runner's egress
-block, the fork gate in the caller), there is no finding.
-
-## Severity
-
-- **high**: a provider secret or GitHub write token reachable by the model
-  or by a pull request's author; code from the reviewed pull request
-  executed in a job holding a secret or write token.
-- **medium**: a secret leaving through a path the scrub misses, with a
-  concrete way the model or the author gets it there.
-- **low**: a real gap with a concrete path an attacker can use today.
-
-## Do not report
-
-Hardening against trusted configuration (secrets, variables, the caller's
-own workflow settings) set wrongly, a future change, tag-pinned actions
-without a traced path to harm, or "consider validating". The residual risks
-the README names (the review job's artifact, a secret disguised some other
-way) are known. Never claim an action or tool version does not exist. No
-proof, no finding.
-
-In `summary`, state the exploitable path and its impact in one or two
-sentences, then the fix.
+In `summary`, state the exploitable path and its impact, then the fix.
