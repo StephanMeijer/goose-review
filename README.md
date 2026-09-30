@@ -2,9 +2,9 @@
 
 An LLM review of your pull requests with [Goose](https://github.com/block/goose),
 where everything the review looks for is yours: your checks, your facts,
-your models. One model reviews, a model of another family verifies every
-finding against the code, and only confirmed findings are posted, as
-comments on the lines they are about. It is advisory: it never blocks a
+your models. Each of your reviewing models reviews in a job of its own,
+one verifying model checks every finding against the code, and only
+confirmed findings are posted, as comments on the lines they are about. It is advisory: it never blocks a
 merge.
 
 It was built for [NotedThat](https://github.com/NotedThat/NotedThat) (PR
@@ -17,7 +17,7 @@ It was built for [NotedThat](https://github.com/NotedThat/NotedThat) (PR
 | **Checks** | `.agents/checks/*.md` | One review type each: security, correctness, your API contract... A check runs only when the PR changes a file its `paths` match, and sees only that part of the diff. |
 | **Facts** | `.agents/facts/*.md` | Things models got wrong about your stack, given to the checks and the verifier when the PR touches their `paths`. Optional. |
 | **Providers** | `.github/goose/providers/*.json` | Goose provider templates: which endpoint, which models, which key. |
-| **Lanes** | your workflow | Each lane: a reviewing model, a verifying model (another family), optionally a backup verifier and a subset of the checks. |
+| **Lanes** | your workflow | Each lane: a reviewing model, optionally with a subset of the checks. One verifier (and a backup) checks every lane's findings. |
 
 Plus, optionally, the paths never reviewed (`ignore`), tool hints for your
 stack (`tools-file`), tools to install for the model (`tools`), and your own rules to replace the built-in "Only
@@ -51,8 +51,8 @@ jobs:
         - lane: deepseek
           provider: my_proxy
           model: deepseek-v4-flash
-          verify-provider: my_proxy
-          verify-model: MiniMax-M3
+      verify-provider: my_proxy
+      verify-model: MiniMax-M3
       egress-endpoints: '["llm-proxy.example.com:443"]'
     secrets:
       PROVIDER_ROUTES: ${{ secrets.GOOSE_REVIEW_ROUTES }}
@@ -65,13 +65,15 @@ pins everything it runs.
 
 Inputs:
 - `lanes` (required): YAML (a list of mappings, see [Lanes](#lanes)) or JSON.
+- The verifier: `verify-provider` and `verify-model` (required),
+  `verify-backup-provider` and `verify-backup-model` (see [Lanes](#lanes)).
 - Directories: `checks-dir`, `facts-dir`, `providers-dir`.
 - Prompt and diff: `ignore`, `tools-file`, `rules-file`.
-- `tools`: linters, renderers and the like to install in the review job and announce to the model (see [Tools](#tools)).
-- Time budgets: `budget-minutes` (35) and `verify-budget-minutes` (12).
-- The review job: `egress-endpoints` (a JSON list of the hosts it may reach beyond GitHub; the allow-list splits on single spaces),
+- `tools`: linters, renderers and the like to install in the review and verify jobs and announce to the models (see [Tools](#tools)).
+- Time budgets, per lane: `budget-minutes` (35) and `verify-budget-minutes` (12).
+- The review and verify jobs: `egress-endpoints` (a JSON list of the hosts they may reach beyond GitHub; the allow-list splits on single spaces),
   `setup` (your preparation, e.g. `cargo fetch --locked`), `runs-on`,
-  `review-timeout-minutes` (60).
+  `review-timeout-minutes` (60), `verify-timeout-minutes` (30).
 
 Secrets:
 - `PROVIDER_ROUTES`: `<template>=<url>` lines.
@@ -79,40 +81,60 @@ Secrets:
 
 ### 2. The composite actions (your own wiring)
 
-`lanes`, `tools`, `tidy`, `review`, `post` and `summary` are what the workflow is made of (`lanes` turns YAML lanes into a matrix; optional when you write the matrix yourself; `tools` installs your tools in the review job, before your setup, and the `review` action takes the same list to announce them);
+`lanes`, `tidy`, `tools`, `review`, `verify` and `post` are what the
+workflow is made of, in four jobs;
 [`examples/hand-wired/`](examples/hand-wired/) wires them by hand.
 
-- `tidy` first: it collapses the review's own resolved threads and marks
+- **plan**: `lanes` checks your lanes and verifier and outputs the lanes
+  as JSON; `tidy` collapses the review's own resolved threads and marks
   the run as running.
-- Then per lane, `review` in one job and `post` in another. Keep those job
-  names: the summary links each lane's row to them.
-- `summary` last.
+- **review**, one job per lane (a matrix over the plan's output): `tools`
+  installs your tools (before your setup), then `review` reviews with the
+  lane's model. Give it the same `tools`, to announce them, and an
+  `artifact` name of its own starting with `goose-review`.
+- **verify**: `verify` fetches every lane's findings and has your verifier
+  check them all.
+- **post**: `post` posts one review with every lane's findings, then the
+  summary comment.
+
+Keep the job names `review (<lane>)`, `verify` and `post`: the summary
+links each lane's row to them.
 
 Each action's inputs are documented in its `action.yml`.
 
 ## Lanes
 
-A lane is one reviewing model and the model that verifies its findings:
+A lane is one reviewing model, in a review job of its own. One verifier
+checks every lane's findings:
 
 ```yaml
 lanes: |
-  - lane: deepseek                    # [a-z0-9-]+; names its review and its row
+  - lane: deepseek                    # [a-z0-9-]+; names its job and its row
     provider: my_proxy                # a template in providers-dir
     model: deepseek-v4-flash
-    verify-provider: my_proxy         # use another model family than the reviewer's
-    verify-model: MiniMax-M3
-    verify-backup-provider: my_proxy  # optional: verifies when the verifier's
-    verify-backup-model: deepseek-v4-flash  #   provider answers empty
     checks: [security, correctness]   # optional: a subset of checks-dir
-    jobs: 2                           # optional: checks at once (1-16, default 2)
+    jobs: 2                           # optional: this lane's checks at once (1-16, default 2)
+  - lane: minimax
+    provider: my_proxy
+    model: MiniMax-M3
+verify-provider: my_proxy             # a template in providers-dir
+verify-model: MiniMax-M3
+verify-backup-provider: my_proxy      # optional: verifies when the verifier's
+verify-backup-model: deepseek-v4-flash  #   provider answers empty
 ```
+
+Choose a verifier of another family than your reviewers where you can: it
+verifies its own family's findings too (here the minimax lane's).
 
 Only this much YAML is read: a list of flat mappings whose values are plain
 or quoted scalars, or lists of them (`[a, b]`, or one `- item` per line);
 comments are fine. JSON works too. Before any lane runs, the `plan` job
-checks every lane: an unknown key (`verify_model`), a missing one, a
-repeated name, half a backup, a check or provider that is not in your
-directories. Each one stops the run, with the error shown on it.
+checks every lane and the verifier: an unknown key (`job`), a missing
+one, a repeated name, half a backup, a check or provider that is not in
+your directories. Each one stops the run, with the error shown on it.
+
+A lane whose provider does not answer, or whose job fails, stops alone:
+the others carry on, and the summary says which lane did not run.
 
 ## Tools
 
@@ -134,7 +156,7 @@ tools: |
 - `url` is an https download: a binary, or a `.tar.gz`, `.tgz`, `.tar.xz`
   or `.zip` archive holding it. `path` picks the file in an archive; without
   it, the one file named like the tool is taken.
-- `sha256` is the download's; a mismatch stops the review job.
+- `sha256` is the download's; a mismatch stops the job.
 - `use` is the one line the model reads about the tool: what it is for and
   how to run it. Say so in it if the tool needs the network.
 - The download host must be in `egress-endpoints` (GitHub's release
@@ -146,36 +168,46 @@ Your `tools-file` hints come after them in the prompt.
 
 ## How a run goes
 
-1. **tidy**: collapses the review's own resolved threads as outdated, and
-   marks the run as running in the summary comment.
-2. **review**, per lane, in a job with a read-only token and its network
+1. **plan**, in seconds, running no model: checks the lanes and the
+   verifier (a mistake stops the run before anything is posted),
+   collapses the review's own resolved threads as outdated, and marks the
+   run as running in the summary comment.
+2. **review**, one job per lane, with a read-only token and its network
    blocked (harden-runner) except for GitHub and your providers:
    1. Install your `tools`, run your `setup`, then install Goose, plus
       ripgrep, fd and ast-grep (all pinned by sha256).
-   2. Install your provider templates and ask each provider for its models
-      (preflight).
-   3. Collect the PR text and the findings someone already answered on this
-      PR.
-   4. Run each matching check as its own `goose run` with a shell in the
-      checkout, within the time budget.
-   5. Have the verifier (or its backup) re-check every finding. It must
-      quote the line that shows the defect; a finding that repeats an
+   2. Install your provider templates and ask the lane's provider for its
+      models (preflight).
+   3. Run each matching check as its own `goose run` with a shell in the
+      checkout, within the lane's time budget.
+   4. Scrub the provider secrets from everything, and upload it.
+3. **verify**, one job for every lane's findings, set up like a review
+   job:
+   1. Fetch the lanes' findings, and collect the PR text and the findings
+      someone already answered on this PR.
+   2. Have the verifier (or its backup, when the verifier's provider
+      answers empty) re-check every lane's findings, the lanes at once. It
+      must quote the line that shows the defect; a finding that repeats an
       answered one is rejected, unless the code the answer relied on
       changed.
-   6. Scrub the provider secrets from everything, and upload it.
-3. **post**, per lane, in a job that runs no model:
-   1. Scrub again: once the model has had a shell in the review job,
-      nothing later in that job is trusted.
-   2. Post one review with the findings on their lines, as
-      `github-actions[bot]` and signed with the models. A finding on lines
-      with an open thread goes into that thread as a reply.
-4. **summary**: one comment, always the pull request's last item:
-   - the latest run on top, per model: Verified by, Checks, Found (what the
-     model raised) and Posted (what a second model confirmed, with the
-     rejected, already-answered and withheld counts), Result, and links to
-     the jobs;
-   - every earlier run folded under "All runs";
-   - per model, how its threads were answered.
+   3. Scrub, and upload the verdicts.
+4. **post**, in a job that runs no model:
+   1. Scrub again: once a model has had a shell in the review or verify
+      jobs, nothing later in them is trusted.
+   2. Post one review with every lane's findings on their lines, as
+      `github-actions[bot]`, each comment signed with its lane's model and
+      the verifier. A lane the verification missed has its findings
+      withheld, not posted unverified. Findings of several lanes on the same lines share one thread:
+      the most severe opens it, the others reply in it. A finding on
+      lines with an open thread from an earlier run goes into that thread
+      as a reply.
+   3. Write the summary: one comment, always the pull request's last item:
+      - the latest run on top, per model: Verified by, Checks, Found (what
+        the model raised) and Posted (what a second model confirmed, with
+        the rejected, already-answered and withheld counts), Result, and
+        links to the jobs;
+      - every earlier run folded under "All runs";
+      - per model, how its threads were answered.
 
 A push never cancels a run in progress. The newest push waits, and pushes
 in between are skipped; every run reviews the whole diff. Each finding asks
@@ -234,21 +266,23 @@ Two settings are load-bearing for OpenAI-compatible endpoints:
 
 ## Security model
 
-- **The review job:** the model runs there with a shell, a read-only
-  token, the network blocked except for what you list, and no sudo. Its
-  environment has no GitHub token, no Actions runtime token and no raw
-  provider settings, only the keys your templates name. The model's shell
-  can read those keys; keep them scoped and spending-capped.
-- **Once the model has run:** nothing later in the review job is trusted.
-  The model can rewrite files, and through the runner's file commands
-  influence later steps.
+- **The review and verify jobs:** the models run there with a shell, a
+  read-only token, the network blocked except for what you list, and no
+  sudo. Their environment has no GitHub token, no Actions runtime token
+  and no raw provider settings, only the keys your templates name. A
+  model's shell can read those keys; keep them scoped and spending-capped.
+- **Once a model has run:** nothing later in its job is trusted. A model
+  can rewrite files, and through the runner's file commands influence
+  later steps. The verifier sees every lane's findings, and its job
+  uploads them all: what `post` publishes is text signed with a lane's
+  model and the verifier, not proof that those models wrote it.
 - **The post job** runs on a fresh runner with this action's own copy of
   the engine, not your checkout. It scrubs the findings again (every
   route, its origin and host, every key; verbatim, base64, hex,
   percent-encoded, reversed) before posting.
 - **What remains:**
-  - The review job's artifact (findings and transcripts, kept 14 days) is
-    only as clean as that job.
+  - The review and verify jobs' artifacts (findings and transcripts, kept
+    14 days) are only as clean as those jobs.
   - A secret disguised some other way is not caught by any scrub.
 
   Run the review only on same-repository pull requests; the example gates
@@ -267,10 +301,15 @@ export GOOSE_REVIEW_PROVIDER_ROUTES='my_proxy=https://proxy.example/route'
 python3 goose_review.py review --base origin/main --provider my_proxy --model deepseek-v4-flash
 python3 goose_review.py verify --base origin/main --provider my_proxy --model MiniMax-M3
 
-# The review a lane would post, without posting it
+# Lanes, as the workflow runs them: each reviews into review/<lane>/, then
+# one verifier checks them all
+export GOOSE_REVIEW_LANES='[{"lane": "deepseek", "provider": "my_proxy", "model": "deepseek-v4-flash"}]'
+python3 goose_review.py review-lanes --base origin/main --out review
+python3 goose_review.py verify-lanes --dir review --base origin/main --provider my_proxy --model MiniMax-M3
+
+# The review the lanes would post, without posting it
 GH_TOKEN=$(gh auth token) python3 goose_review.py post --dry-run --repo owner/repo --pr 123 \
-  --head-sha "$(git rev-parse HEAD)" --base-sha "$(git rev-parse origin/main)" \
-  --lane deepseek --model deepseek-v4-flash
+  --head-sha "$(git rev-parse HEAD)" --base-sha "$(git rev-parse origin/main)" --dir review --verify-model MiniMax-M3
 ```
 
 Run these from your repository, calling this repository's `goose_review.py`.

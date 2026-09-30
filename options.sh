@@ -1,10 +1,10 @@
 # shellcheck shell=bash
-# Sourced by the review action's review and verify steps: turns the
-# caller's settings (in the environment, never interpolated into a script)
-# into goose_review.py options. One glob per line for IGNORE (blank lines
-# and surrounding whitespace dropped); CHECKS as described below.
+# Sourced by the review action's review step: turns the caller's settings
+# (in the environment, never interpolated into a script) into the
+# goose_review.py options every lane's review and verify share. One glob
+# per line for IGNORE (blank lines and surrounding whitespace dropped).
 #
-# Sets `options` (shared by review and verify) and `checks` (review only).
+# Sets `options`.
 
 lines() {
   local line
@@ -22,9 +22,3 @@ if [ -n "${TOOLS_FILE:-}" ]; then options+=(--tools-file "$TOOLS_FILE"); fi
 if [ -n "${TOOLS:-}" ]; then options+=(--tools "$TOOLS"); fi
 if [ -n "${RULES_FILE:-}" ]; then options+=(--rules-file "$RULES_FILE"); fi
 
-# Check names are file names: split on whitespace and commas, so a lane's
-# list can arrive one per line or joined on one line (a workflow matrix
-# cannot join with a newline).
-checks=()
-read -r -a names <<<"$(tr ',\n\r' '   ' <<<"${CHECKS:-}")"
-for name in "${names[@]}"; do checks+=(--check "$name"); done

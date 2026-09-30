@@ -1,10 +1,10 @@
 # The pre-composed review.yml end to end, on every pull request of this
 # repository, with tests/fake-goose for the models and a local server for
 # the providers' preflight. Two lanes: `alpha` through a routed provider,
-# `beta` through a direct one, slower (it posts into alpha's open thread)
-# and verified by its backup (its verifier answers empty). `assert` then
-# reads the pull request back. The branch e2e/fixture adds the planted
-# line; on other pull requests (while this repository does not review
+# `beta` through a direct one; both find the planted line, so beta's
+# finding is a reply in alpha's thread. The verifier answers empty, so its
+# backup verifies. `assert` then reads the pull request back. The branch
+# e2e/fixture adds the planted line; on other pull requests (while this repository does not review
 # itself, see goose-review.yml) the check has nothing to review, and only
 # the summary is asserted.
 name: End-to-end
@@ -40,17 +40,16 @@ jobs:
         - lane: alpha
           provider: routed
           model: fake-a
-          verify-provider: direct
-          verify-model: fake-verifier
 
         - lane: beta
           provider: direct
-          model: fake-b              # slow: posts into alpha's open thread
-          verify-provider: direct
-          verify-model: fake-empty   # answers empty: its backup verifies
-          verify-backup-provider: direct
-          verify-backup-model: fake-backup
+          model: fake-b
           checks: [planted]
+      # Answers empty: its backup verifies.
+      verify-provider: direct
+      verify-model: fake-empty
+      verify-backup-provider: direct
+      verify-backup-model: fake-backup
       checks-dir: tests/e2e/checks
       facts-dir: tests/e2e/facts
       providers-dir: tests/e2e/providers

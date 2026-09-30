@@ -11,9 +11,6 @@ It answers the way the engine reads Goose: a JSON document with the run's
 - A model named in FAKE_GOOSE_EMPTY_MODELS (space-separated) answers every
   turn empty with no tokens, like a provider past its usage limit, so the
   backup verifier takes over.
-- A model named in FAKE_GOOSE_SLOW_MODELS (space-separated) takes
-  FAKE_GOOSE_SLOW_SECONDS (default 90) before answering a review, so its
-  lane posts after the others and replies in their open thread.
 - `goose --version` prints a version.
 """
 
@@ -21,7 +18,6 @@ import json
 import os
 import re
 import sys
-import time
 from pathlib import Path
 
 MARK = "GOOSE-REVIEW-E2E"
@@ -90,8 +86,6 @@ def main() -> None:
     if "--resume" in args and session.exists():
         answer(session.read_text(encoding="utf-8"))
         return
-    if "## Diff" in prompt and model in os.environ.get("FAKE_GOOSE_SLOW_MODELS", "").split():
-        time.sleep(float(os.environ.get("FAKE_GOOSE_SLOW_SECONDS", "90")))
     text = verify(prompt) if "## Findings" in prompt else review(prompt) if "## Diff" in prompt else ""
     session.write_text(text, encoding="utf-8")
     answer(text)

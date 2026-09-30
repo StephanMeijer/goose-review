@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+- **Breaking:** one verifier for every lane. A lane is now `lane`,
+  `provider`, `model` (and optionally `checks`, `jobs`); the verifier is
+  the workflow's `verify-provider` and `verify-model`, with an optional
+  `verify-backup-provider` and `verify-backup-model`. A lane that still
+  names a verifier is an error in the plan job.
+- **Breaking:** a run is `plan`, a `review (<lane>)` job per lane (review
+  only), one `verify` job (the verifier checks every lane's findings) and
+  one `post` job (one review with every lane's findings, then the summary
+  comment). `lane.yml` and the separate `tidy` and `summary` jobs are
+  gone: `tidy` runs in `plan`, and `post` writes the summary.
+- **Breaking (hand-wired callers):** a new `verify` action; `review`
+  takes `lanes` (usually one lane, from the matrix) and an `artifact` name,
+  and no longer verifies; `post` takes `lanes` and `verify-model`; the
+  `summary` action is gone. See [`examples/hand-wired/`](examples/hand-wired/).
+- One review per run instead of one per lane: each comment is still signed
+  with its lane's model and the verifier, and findings of several lanes on
+  the same lines share one thread (the most severe opens it, the others
+  reply).
+- When the verify job does not finish, `post` withholds the lanes'
+  findings as unconfirmed, and says so, rather than posting them.
+
 ## 0.4.0
 
 - `tools`: install your own tools in the review job and tell the model it
