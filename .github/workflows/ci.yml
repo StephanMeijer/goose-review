@@ -27,7 +27,7 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Shellcheck
-        run: shellcheck render-provider.sh setup-providers.sh options.sh scripts/*.sh tests/e2e/setup.sh
+        run: shellcheck install.sh render-provider.sh setup-providers.sh options.sh scripts/*.sh tests/e2e/setup.sh
 
       - name: Actionlint
         env:

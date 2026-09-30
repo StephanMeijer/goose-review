@@ -1,7 +1,7 @@
 """The engine end to end with tests/fake-goose, no network: review finds the
 planted line, verify keeps it with evidence, and a verifier that answers
-empty hands over to the backup; review-lanes does both for every lane at
-once. Run: python3 -m unittest discover -s tests"""
+empty hands over to the backup; review-lanes reviews with every lane and
+verify-lanes checks all their findings with one verifier. Run: python3 -m unittest discover -s tests"""
 
 import http.server
 import json
@@ -97,8 +97,9 @@ class Engine(Repo):
 
 
 class Lanes(Repo):
-    """review-lanes: every lane in one call, each in its own directory; a
-    lane whose provider does not answer stops alone."""
+    """review-lanes then verify-lanes: every lane reviews into its own
+    directory, and one verifier checks them all; a lane whose provider does
+    not answer stops alone."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -114,33 +115,67 @@ class Lanes(Repo):
         }))
         self.env["XDG_CONFIG_HOME"] = str(self.repo / ".config")
 
-    def lanes(self, lanes: list[dict]) -> subprocess.CompletedProcess:
+    def run_engine(self, lanes: list[dict], *args: str, **env: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, str(ENGINE), "review-lanes", "--base", "HEAD~1", "--out", "out", "--", "--ignore", "gen/**"],
+            [sys.executable, str(ENGINE), *args, "--", "--ignore", "gen/**"],
             cwd=self.repo, env={**self.env, "GOOSE_REVIEW_LANES": json.dumps(lanes),
-                                "GOOSE_REVIEW_LOG_DIR": str(self.repo / "logs")},
+                                "GOOSE_REVIEW_LOG_DIR": str(self.repo / "logs"), **env},
             capture_output=True, text=True,
         )
 
-    def lane(self, name: str, **more: object) -> dict:
-        return {"lane": name, "provider": "p", "model": f"{name}-reviewer", "verify-provider": "p",
-                "verify-model": f"{name}-verifier", **more}
+    def lanes(self, lanes: list[dict]) -> subprocess.CompletedProcess:
+        return self.run_engine(lanes, "review-lanes", "--base", "HEAD~1", "--out", "out")
 
-    def test_every_lane_reviews_and_verifies(self) -> None:
-        done = self.lanes([self.lane("a"), self.lane("b", checks=["other"])])
+    def verify_lanes(self, lanes: list[dict], **env: str) -> subprocess.CompletedProcess:
+        return self.run_engine(lanes, "verify-lanes", "--dir", "out", "--base", "HEAD~1", "--provider", "p",
+                               "--model", "verifier", "--backup-provider", "p", "--backup-model", "backup", **env)
+
+    def lane(self, name: str, **more: object) -> dict:
+        return {"lane": name, "provider": "p", "model": f"{name}-reviewer", **more}
+
+    def lane_status(self, name: str) -> dict:
+        return json.loads((self.repo / "out" / name / "status.json").read_text())
+
+    def test_every_lane_reviews_then_one_verifier_checks_them_all(self) -> None:
+        both = [self.lane("a"), self.lane("b", checks=["other"])]
+        done = self.lanes(both)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual(len(self.read("a/verified.jsonl")), 1)
-        self.assertEqual(self.read("b/verified.jsonl"), [])
-        self.assertEqual(json.loads((self.repo / "out/b/status.json").read_text())["checks_run"], [])
+        self.assertEqual(len(self.read("a/findings.jsonl")), 1)
+        self.assertFalse((self.repo / "out/a/verified.jsonl").exists())
+        self.assertEqual(self.lane_status("b")["checks_run"], [])
         self.assertIn("[a] ", done.stdout)
         self.assertTrue(any((self.repo / "logs" / "a").iterdir()))
+        done = self.verify_lanes(both, FAKE_GOOSE_EMPTY_MODELS="verifier")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual([f.get("verified_by") for f in self.read("a/verified.jsonl")], ["backup"])
+        self.assertEqual(self.read("b/verified.jsonl"), [])
+        # The review's status and the verification's, together.
+        self.assertEqual(self.lane_status("a")["checks_run"], ["planted"])
+        self.assertEqual(self.lane_status("a")["verified_by"], ["backup"])
 
     def test_a_lane_whose_provider_is_missing_fails_alone(self) -> None:
-        done = self.lanes([self.lane("a"), self.lane("b", provider="nowhere")])
+        both = [self.lane("a"), self.lane("b", provider="nowhere")]
+        done = self.lanes(both)
         self.assertEqual(done.returncode, 1)
-        self.assertEqual(len(self.read("a/verified.jsonl")), 1)
-        self.assertIn("nowhere provider is not configured", json.loads((self.repo / "out/b/status.json").read_text())["error"])
+        self.assertEqual(len(self.read("a/findings.jsonl")), 1)
+        self.assertIn("nowhere provider is not configured", self.lane_status("b")["error"])
         self.assertIn("::warning::b: preflight failed", done.stdout)
+        done = self.verify_lanes(both)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(len(self.read("a/verified.jsonl")), 1)
+        self.assertIn("lane b: no findings file", done.stderr)
+
+    def test_no_verification_when_the_verifiers_provider_is_missing(self) -> None:
+        self.lanes([self.lane("a")])
+        done = self.run_engine([self.lane("a")], "verify-lanes", "--dir", "out", "--base", "HEAD~1",
+                               "--provider", "nowhere", "--model", "verifier")
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse((self.repo / "out/a/verified.jsonl").exists())
+
+    def test_fail_records_the_error_for_every_lane(self) -> None:
+        done = self.run_engine([self.lane("a"), self.lane("b")], "review-lanes", "--out", "out", "--fail", "no providers")
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual([self.lane_status(n)["error"] for n in "ab"], ["no providers", "no providers"])
 
 
 class Models(http.server.BaseHTTPRequestHandler):

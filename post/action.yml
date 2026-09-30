@@ -1,16 +1,20 @@
 name: Goose review - post
 description: >-
   Publishes every lane's verified findings on the pull request as one
-  review, each comment signed with the models of its lane, then writes the
-  run's summary comment. Runs in a job of its own that runs no model. The
-  review job's artifact is scrubbed again here first: once the models had
-  a shell in the review job, nothing later in that job can be trusted, and
-  this job runs on a fresh runner with the action's own copy of the script.
+  review, each comment signed with its lane's model and the verifier, then
+  writes the run's summary comment. Runs in a job of its own that runs no
+  model. The review and verify jobs' artifacts are scrubbed again here
+  first: once a model had a shell in those jobs, nothing later in them can
+  be trusted, and this job runs on a fresh runner with the action's own
+  copy of the script.
 author: Stephan Meijer
 
 inputs:
   lanes:
-    description: The lanes, as given to the review action.
+    description: Every lane, as given to the review jobs.
+    required: true
+  verify-model:
+    description: The verifier, as given to the verify action, for the signature.
     required: true
   provider-routes:
     description: Secret. The same value as the review action's; only redacted here.
@@ -35,14 +39,24 @@ runs:
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
       run: python3 "$GITHUB_ACTION_PATH/../goose_review.py" mask
 
-    # Missing when the review job failed before uploading; every lane is
-    # then reported as "the review did not run".
-    - name: Fetch the review
+    # The verify job's artifact: every lane's findings, verdicts and status.
+    - name: Fetch the verification
       continue-on-error: true
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: goose-review
-        path: ${{ runner.temp }}/artifact
+        name: goose-verify
+        path: ${{ runner.temp }}/artifact/verify
+
+    # The review jobs' own, for a lane the verification does not have (the
+    # verify job failed): its findings, unverified, are withheld. A lane
+    # with neither did not run.
+    - name: Fetch the reviews
+      continue-on-error: true
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        pattern: goose-review*
+        merge-multiple: true
+        path: ${{ runner.temp }}/artifact/lanes
 
     - name: Scrub the findings again
       shell: bash
@@ -50,7 +64,7 @@ runs:
         GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
       run: |
-        mkdir -p "$RUNNER_TEMP/artifact/review"
+        mkdir -p "$RUNNER_TEMP/artifact"
         python3 "$GITHUB_ACTION_PATH/../goose_review.py" scrub "$RUNNER_TEMP/artifact"
 
     - name: Post the review
@@ -62,10 +76,12 @@ runs:
         PR: ${{ github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        VERIFY_MODEL: ${{ inputs.verify-model }}
       run: >
         python3 "$GITHUB_ACTION_PATH/../goose_review.py" post
         --repo "$REPO" --pr "$PR" --head-sha "$HEAD_SHA" --base-sha "$BASE_SHA"
-        --dir "$RUNNER_TEMP/artifact/review" --results "$RUNNER_TEMP/results"
+        --dir "$RUNNER_TEMP/artifact/verify/lanes/review" --dir "$RUNNER_TEMP/artifact/lanes/review"
+        --verify-model "$VERIFY_MODEL" --results "$RUNNER_TEMP/results"
 
     # Last, also when posting failed: one comment, always the pull
     # request's last item, with every lane of this run (a lane without a

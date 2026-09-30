@@ -251,21 +251,27 @@ class Posting(unittest.TestCase):
 
     def test_one_review_for_every_lane(self) -> None:
         root = Path(tempfile.mkdtemp())
-        lanes = [{"lane": n, "provider": "p", "model": f"{n}-model", "verify-provider": "p", "verify-model": "v"}
-                 for n in ("a", "b", "c")]
-        for name, line in (("a", 3), ("b", 4)):
-            (root / "review" / name).mkdir(parents=True)
+        lanes = [{"lane": n, "provider": "p", "model": f"{n}-model"} for n in ("a", "b", "c", "d")]
+        # a and b verified; d reviewed, but the verify job has nothing of it;
+        # c did not run.
+        for name, line in (("a", 3), ("b", 4), ("d", 9)):
             finding = {**at("x.py", line, line), "check": name}
-            (root / "review" / name / "verified.jsonl").write_text(json.dumps(finding) + "\n")
-            (root / "review" / name / "findings.jsonl").write_text(json.dumps(finding) + "\n")
+            for stage, verified in (("lanes", False), ("verify", True)):
+                if stage == "verify" and name == "d":
+                    continue
+                own = root / stage / name
+                own.mkdir(parents=True)
+                (own / "findings.jsonl").write_text(json.dumps(finding) + "\n")
+                if verified:
+                    (own / "verified.jsonl").write_text(json.dumps(finding) + "\n")
         calls = []
 
         def github(method, url, token, body=None, accept=None):  # noqa: ANN001
             calls.append((method, url, body))
             return (200, {"id": 9, "html_url": "https://review"}) if url.endswith("/reviews") else (201, {})
 
-        args = SimpleNamespace(repo="o/r", pr=1, head_sha="h", base_sha="b", dir=str(root / "review"),
-                               results=str(root / "results"), dry_run=False)
+        args = SimpleNamespace(repo="o/r", pr=1, head_sha="h", base_sha="b", dir=[str(root / "verify"), str(root / "lanes")],
+                               verify_model="v", results=str(root / "results"), dry_run=False)
         env = {"GH_TOKEN": "t", g.LANES_ENV: json.dumps(lanes)}
         with mock.patch.dict(os.environ, env), \
                 mock.patch.object(g, "compare_files", return_value=[{"filename": "x.py", "patch": "@@ -1,0 +1,5 @@\n" + "+\n" * 5}]), \
@@ -277,13 +283,15 @@ class Posting(unittest.TestCase):
         reviews = [body for method, url, body in calls if url.endswith("/reviews")]
         self.assertEqual(len(reviews), 1)
         self.assertEqual([c["line"] for c in reviews[0]["comments"]], [3])
-        self.assertEqual([m["name"] for m in g.markers(reviews[0]["body"], "lane")], ["a", "b", "c"])
+        self.assertEqual([m["name"] for m in g.markers(reviews[0]["body"], "lane")], ["a", "b", "c", "d"])
         replies = [body for method, url, body in calls if url.endswith("/comments/5/replies")]
         self.assertEqual([g.posted_finding(r["body"])["model"] for r in replies], ["b-model"])
-        results = {n: json.loads((root / "results" / f"{n}.json").read_text()) for n in ("a", "b", "c")}
-        self.assertEqual([results[n]["review_url"] for n in "abc"], ["https://review", "https://review", None])
+        results = {n: json.loads((root / "results" / f"{n}.json").read_text()) for n in "abcd"}
+        self.assertEqual([results[n]["review_url"] for n in "abcd"], ["https://review", "https://review", None, None])
         self.assertTrue(results["c"]["did_not_run"])
+        self.assertEqual((results["d"]["withheld"], results["d"]["did_not_run"]), (1, False))
         self.assertEqual(results["b"]["found"], 1)
+        self.assertEqual(results["b"]["verify_model"], "v")
 
 
 class Described(unittest.TestCase):

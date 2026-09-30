@@ -1,21 +1,22 @@
 name: Goose review - review
 description: >-
-  Every lane's review, at once: in each lane the caller's checks run with
-  its model, a model of another family verifies every finding, and the
-  results are scrubbed and uploaded, one directory per lane, for the
-  `post` action. Runs in a job with a read-only token and its network
-  blocked but for what it needs (the caller's harden-runner step comes
-  first). The models get a shell in the checkout; nothing later in this
-  job is trusted, which is why `post` runs in another job.
+  The review of the lanes given -- one per job, as the pre-composed
+  workflow runs them, or several at once: in each lane the caller's checks
+  run with its model, and the findings are scrubbed and uploaded, one
+  directory per lane, for the `verify` action. Runs in a job with a
+  read-only token and its network blocked but for what it needs (the
+  caller's harden-runner step comes first). The model gets a shell in the
+  checkout; nothing later in this job is trusted, which is why `post`
+  runs in another job.
 author: Stephan Meijer
 
 inputs:
   lanes:
     description: >-
-      Every lane, as YAML (a list of mappings) or JSON: lane, provider,
-      model, verify-provider, verify-model, and optionally
-      verify-backup-provider and verify-backup-model, checks and jobs. See
-      the README. All lanes run at once, each with its own models.
+      The lanes to review, as YAML (a list of mappings) or JSON: lane,
+      provider, model, and optionally checks and jobs. See the README.
+      Usually one lane per job; several run at once, each with its own
+      model.
     required: true
   checks-dir:
     description: Directory of the check files.
@@ -43,9 +44,6 @@ inputs:
   budget-minutes:
     description: Each lane's wall-clock budget for its checks.
     default: "35"
-  verify-budget-minutes:
-    description: Each lane's wall-clock budget for verification.
-    default: "12"
   provider-routes:
     description: >-
       Secret. Lines `<template name>=<url>`: each renders that template for
@@ -57,9 +55,12 @@ inputs:
       Secret. Lines `NAME=value` (API keys, tokens) that only the Goose
       process gets; a template's `api_key_env` names one.
     default: ""
-  github-token:
-    description: Reads the pull request's answered findings; needs pull-requests read. Never reaches the model.
-    default: ${{ github.token }}
+  artifact:
+    description: >-
+      The name of the artifact the findings and transcripts are uploaded
+      as. It must start with goose-review, which `verify` and `post` fetch;
+      give each review job its own (e.g. goose-review-<lane>).
+    default: goose-review
   install-goose:
     description: Install Goose. `false` expects a `goose` on PATH (CI uses a fake one).
     default: "true"
@@ -76,76 +77,33 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Prepare
+    - name: Mask the provider settings
       shell: bash
       env:
         GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
-      run: |
-        python3 "$GITHUB_ACTION_PATH/../goose_review.py" mask
-        mkdir -p "$RUNNER_TEMP/review" "$RUNNER_TEMP/bin"
-        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-        {
-          # Config (with the providers) and transcripts live outside the
-          # checkout the agent works in.
-          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/goose-config"
-          echo "GOOSE_REVIEW_LOG_DIR=$RUNNER_TEMP/goose-logs"
-          # No keyring on a runner; keys come from provider-env.
-          echo "GOOSE_DISABLE_KEYRING=1"
-          # Goose reports usage unless told not to.
-          echo "GOOSE_TELEMETRY_OFF=1"
-          echo "GOOSE_TELEMETRY_ENABLED=false"
-        } >> "$GITHUB_ENV"
+      run: python3 "$GITHUB_ACTION_PATH/../goose_review.py" mask
 
-    - name: Install Goose ${{ inputs.goose-version }}
-      if: inputs.install-goose == 'true'
+    - name: Install Goose and the reviewer's tools
       shell: bash
       env:
+        LOG_DIR: ${{ runner.temp }}/goose-logs
+        INSTALL_GOOSE: ${{ inputs.install-goose }}
+        INSTALL_TOOLS: ${{ inputs.install-tools }}
         GOOSE_VERSION: ${{ inputs.goose-version }}
         GOOSE_SHA256: ${{ inputs.goose-sha256 }}
-      run: |
-        cd "$RUNNER_TEMP"
-        curl -sSfL -o goose.tar.gz \
-          "https://github.com/block/goose/releases/download/$GOOSE_VERSION/goose-x86_64-unknown-linux-gnu.tar.gz"
-        echo "$GOOSE_SHA256  goose.tar.gz" | sha256sum -c -
-        tar xzf goose.tar.gz -C bin ./goose
-        bin/goose --version
-
-    # What the tools prompt tells the model it can use. From release
-    # archives pinned by sha256, not apt, whose mirrors an egress policy
-    # would have to allow. git and jq come with the runner.
-    - name: Install the reviewer's tools
-      if: inputs.install-tools == 'true'
-      shell: bash
-      env:
-        RG_VERSION: 15.2.0
-        RG_SHA256: 33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
-        FD_VERSION: v10.5.0
-        FD_SHA256: 761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7
-        AST_GREP_VERSION: 0.45.3
-        AST_GREP_SHA256: f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8
-      run: |
-        cd "$RUNNER_TEMP"
-        fetch() { curl -sSfL -o "$1" "$2" && echo "$3  $1" | sha256sum -c -; }
-        rg="ripgrep-$RG_VERSION-x86_64-unknown-linux-musl"
-        fetch rg.tar.gz "https://github.com/BurntSushi/ripgrep/releases/download/$RG_VERSION/$rg.tar.gz" "$RG_SHA256"
-        tar xzf rg.tar.gz -C bin --strip-components=1 "$rg/rg"
-        fd="fd-$FD_VERSION-x86_64-unknown-linux-musl"
-        fetch fd.tar.gz "https://github.com/sharkdp/fd/releases/download/$FD_VERSION/$fd.tar.gz" "$FD_SHA256"
-        tar xzf fd.tar.gz -C bin --strip-components=1 "$fd/fd"
-        fetch ast-grep.zip "https://github.com/ast-grep/ast-grep/releases/download/$AST_GREP_VERSION/app-x86_64-unknown-linux-gnu.zip" "$AST_GREP_SHA256"
-        unzip -q -o ast-grep.zip ast-grep -d bin
-        bin/rg --version | head -1; bin/fd --version; bin/ast-grep --version
+      run: '"$GITHUB_ACTION_PATH/../install.sh"'
 
     - name: Configure the Goose providers
       shell: bash
       env:
         PROVIDERS_DIR: ${{ inputs.providers-dir }}
         GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
+        GOOSE_REVIEW_LANES: ${{ inputs.lanes }}
       run: |
         if ! "$GITHUB_ACTION_PATH/../setup-providers.sh" "$PROVIDERS_DIR" "$XDG_CONFIG_HOME/goose/custom_providers"; then
-          jq -n '{error: "the provider settings are invalid (see the review job log)"}' > "$RUNNER_TEMP/review/status.json"
-          exit 1
+          python3 "$GITHUB_ACTION_PATH/../goose_review.py" review-lanes --out "$RUNNER_TEMP/review" \
+            --fail "the provider settings are invalid (see the review job log)"
         fi
 
     # Title and body go through the environment into a file: PR text is
@@ -157,31 +115,16 @@ runs:
         BODY: ${{ github.event.pull_request.body }}
       run: printf '# %s\n\n%s\n' "$TITLE" "$BODY" > "$RUNNER_TEMP/pr.md"
 
-    # Findings on this pull request that someone already answered, so the
-    # verifier rejects a repeat. Before any model runs, and the only step
-    # with the token. Without the file, verification goes without it.
-    - name: Collect the answered findings
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.github-token }}
-        REPO: ${{ github.repository }}
-        PR: ${{ github.event.pull_request.number }}
-      run: >
-        python3 "$GITHUB_ACTION_PATH/../goose_review.py" answered
-        --repo "$REPO" --pr "$PR" --out "$RUNNER_TEMP/answered.json"
-        || echo "::warning::could not collect the answered findings; verifying without them"
-
-    # Each lane checks its providers, reviews and verifies, all lanes at
-    # once, into $RUNNER_TEMP/review/<lane>/. A lane that fails stops
-    # alone; `post` reports it.
-    - name: Review and verify, every lane
+    # Each lane checks its provider and reviews, into
+    # $RUNNER_TEMP/review/<lane>/. A lane that fails stops alone; `post`
+    # reports it.
+    - name: Review
       shell: bash
       env:
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
         GOOSE_REVIEW_LANES: ${{ inputs.lanes }}
         BASE: ${{ github.event.pull_request.base.sha }}
         BUDGET: ${{ inputs.budget-minutes }}
-        VERIFY_BUDGET: ${{ inputs.verify-budget-minutes }}
         CHECKS_DIR: ${{ inputs.checks-dir }}
         FACTS_DIR: ${{ inputs.facts-dir }}
         IGNORE: ${{ inputs.ignore }}
@@ -191,26 +134,28 @@ runs:
       run: |
         source "$GITHUB_ACTION_PATH/../options.sh"
         python3 "$GITHUB_ACTION_PATH/../goose_review.py" review-lanes \
-          --base "$BASE" --context "$RUNNER_TEMP/pr.md" --answered "$RUNNER_TEMP/answered.json" \
-          --budget-minutes "$BUDGET" --verify-budget-minutes "$VERIFY_BUDGET" \
+          --base "$BASE" --context "$RUNNER_TEMP/pr.md" --budget-minutes "$BUDGET" \
           --out "$RUNNER_TEMP/review" -- "${options[@]}"
 
     # The model could write to these directories through its shell, so
     # everything uploaded is scrubbed first, not only what the script wrote.
-    # `post` scrubs again on its own runner: this job is not trusted.
+    # `verify` and `post` scrub again on their own runners: this job is not
+    # trusted.
     - name: Scrub the findings and transcripts
       if: always()
       shell: bash
       env:
         GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
-      run: python3 "$GITHUB_ACTION_PATH/../goose_review.py" scrub "$RUNNER_TEMP/review" "$RUNNER_TEMP/goose-logs"
+      run: |
+        mkdir -p "$RUNNER_TEMP/review" "$RUNNER_TEMP/goose-logs"
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" scrub "$RUNNER_TEMP/review" "$RUNNER_TEMP/goose-logs"
 
     - name: Keep the findings and transcripts
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: goose-review
+        name: ${{ inputs.artifact }}
         path: |
           ${{ runner.temp }}/review/**/*.jsonl
           ${{ runner.temp }}/review/**/status.json

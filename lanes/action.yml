@@ -2,9 +2,9 @@ name: Goose review - lanes
 description: >-
   Reads the caller's lanes -- YAML (a list of mappings) or JSON -- checks
   them against the checks and provider templates in the checkout, and
-  outputs them as JSON for the review and post actions. A mistyped key, a missing model,
-  an unknown check or provider is an error here, before any lane runs.
-  So is a malformed tool, when the caller's tools are given.
+  outputs them as JSON for the review, verify and post actions. A mistyped
+  key, a missing model, an unknown check or provider is an error here,
+  before any lane runs. So is a malformed tool or verifier, when given.
 author: Stephan Meijer
 
 inputs:
@@ -19,6 +19,18 @@ inputs:
     default: .github/goose/providers
   tools:
     description: The caller's tools (see the tools action), checked here too. Optional.
+    default: ""
+  verify-provider:
+    description: The verifier's provider, checked here too. Optional.
+    default: ""
+  verify-model:
+    description: The verifier. Optional.
+    default: ""
+  verify-backup-provider:
+    description: The backup verifier's provider. Optional.
+    default: ""
+  verify-backup-model:
+    description: The backup verifier. Optional.
     default: ""
 
 outputs:
@@ -37,6 +49,12 @@ runs:
         CHECKS_DIR: ${{ inputs.checks-dir }}
         PROVIDERS_DIR: ${{ inputs.providers-dir }}
         GOOSE_REVIEW_TOOLS: ${{ inputs.tools }}
+        VERIFY_PROVIDER: ${{ inputs.verify-provider }}
+        VERIFY_MODEL: ${{ inputs.verify-model }}
+        VERIFY_BACKUP_PROVIDER: ${{ inputs.verify-backup-provider }}
+        VERIFY_BACKUP_MODEL: ${{ inputs.verify-backup-model }}
       run: >
         python3 "$GITHUB_ACTION_PATH/../goose_review.py" lanes
         --checks-dir "$CHECKS_DIR" --providers-dir "$PROVIDERS_DIR"
+        --verify-provider "$VERIFY_PROVIDER" --verify-model "$VERIFY_MODEL"
+        --verify-backup-provider "$VERIFY_BACKUP_PROVIDER" --verify-backup-model "$VERIFY_BACKUP_MODEL"

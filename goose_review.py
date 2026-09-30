@@ -8,8 +8,9 @@
           keep only the ones it confirms;
   post    publish what is left as one GitHub pull request review.
 
-`review-lanes` runs review and verify for every lane at once, each lane
-with its own models; `post` then publishes all their findings together.
+`review-lanes` runs the review of every lane given at once, each with its
+own model; `verify-lanes` has one verifier check every lane's findings;
+`post` then publishes all of them together.
 
 Why not `goose review`: it runs each check with `--no-profile` and no
 extensions, so the model sees the diff and nothing else -- it cannot open a
@@ -428,8 +429,8 @@ def selected_checks() -> list[Check]:
 # standard-library only and runs on any runner; anything else is an error
 # naming its line, as is a key no lane has.
 
-LANE_REQUIRED = ("lane", "provider", "model", "verify-provider", "verify-model")
-LANE_OPTIONAL = ("verify-backup-provider", "verify-backup-model", "checks", "jobs")
+LANE_REQUIRED = ("lane", "provider", "model")
+LANE_OPTIONAL = ("checks", "jobs")
 LANE_NAME_RE = re.compile(r"[a-z0-9-]+")
 
 
@@ -553,9 +554,6 @@ def validate_lanes(lanes: list[dict], checks: list[str] | None = None,
         if name in names:
             problems.append(f"{label}: the name `{name}` is used twice")
         names.add(name)
-        backup = [lane.get(k) or "" for k in ("verify-backup-provider", "verify-backup-model")]
-        if bool(backup[0]) != bool(backup[1]):
-            problems.append(f"{label}: give both verify-backup-provider and verify-backup-model, or neither")
         raw_checks = lane.get("checks") or []
         names_of_checks = raw_checks.replace(",", " ").split() if isinstance(raw_checks, str) else [str(c) for c in raw_checks]
         if checks is not None:
@@ -569,18 +567,27 @@ def validate_lanes(lanes: list[dict], checks: list[str] | None = None,
         except (TypeError, ValueError):
             problems.append(f"{label}: jobs must be a number from 1 to 16")
             jobs = 2
-        if providers is not None:
-            for key in ("provider", "verify-provider", "verify-backup-provider"):
-                if lane.get(key) and lane[key] not in providers:
-                    problems.append(f"{label}: {key} `{lane[key]}` has no template (there are {', '.join(providers)})")
-        out.append({
-            **{k: lane[k].strip() for k in LANE_REQUIRED},
-            "verify-backup-provider": backup[0], "verify-backup-model": backup[1],
-            "checks": names_of_checks, "jobs": jobs,
-        })
+        if providers is not None and lane["provider"] not in providers:
+            problems.append(f"{label}: provider `{lane['provider']}` has no template (there are {', '.join(providers)})")
+        out.append({**{k: lane[k].strip() for k in LANE_REQUIRED}, "checks": names_of_checks, "jobs": jobs})
     if problems:
         raise LanesError("\n".join(problems))
     return out
+
+
+def validate_verifier(provider: str, model: str, backup_provider: str = "", backup_model: str = "",
+                      providers: list[str] | None = None) -> None:
+    """The one verifier every lane's findings go to, and its backup."""
+    problems = []
+    if not provider.strip() or not model.strip():
+        problems.append("verify-provider and verify-model are both required")
+    if bool(backup_provider.strip()) != bool(backup_model.strip()):
+        problems.append("give both verify-backup-provider and verify-backup-model, or neither")
+    for key, value in (("verify-provider", provider), ("verify-backup-provider", backup_provider)):
+        if providers is not None and value.strip() and value.strip() not in providers:
+            problems.append(f"{key} `{value.strip()}` has no template (there are {', '.join(providers)})")
+    if problems:
+        raise LanesError("\n".join(problems))
 
 
 def cmd_lanes(args: argparse.Namespace) -> None:
@@ -592,6 +599,9 @@ def cmd_lanes(args: argparse.Namespace) -> None:
     providers = sorted(p.stem for p in providers_dir.glob("*.json")) if providers_dir.is_dir() else None
     try:
         lanes = validate_lanes(parse_lanes(os.environ.get("GOOSE_REVIEW_LANES", "")), checks, providers)
+        if args.verify_provider or args.verify_model:
+            validate_verifier(args.verify_provider or "", args.verify_model or "",
+                              args.verify_backup_provider or "", args.verify_backup_model or "", providers)
         parse_tools(os.environ.get("GOOSE_REVIEW_TOOLS", ""))
     except LanesError as error:
         for line in str(error).splitlines():
@@ -599,9 +609,11 @@ def cmd_lanes(args: argparse.Namespace) -> None:
         raise SystemExit(1)
     text = json.dumps(lanes, separators=(",", ":"))
     for lane in lanes:
-        verify = lane["verify-model"] + (f", backup {lane['verify-backup-model']}" if lane["verify-backup-model"] else "")
-        print(f"lane {lane['lane']}: {lane['model']} reviews, {verify} verifies"
+        print(f"lane {lane['lane']}: {lane['model']} reviews"
               + (f"; checks {', '.join(lane['checks'])}" if lane["checks"] else ""), file=sys.stderr)
+    if args.verify_model:
+        backup = f", backup {args.verify_backup_model}" if args.verify_backup_model else ""
+        print(f"{args.verify_model}{backup} verifies every lane's findings", file=sys.stderr)
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
             out.write(f"lanes={text}\n")
@@ -1565,18 +1577,12 @@ def lanes_from_env() -> list[dict]:
         raise SystemExit(1)
 
 
-def cmd_review_lanes(args: argparse.Namespace) -> None:
-    """Every lane in one job, at once: each checks its providers, runs its
-    checks with its model and has its verifier re-check the findings, as
-    the `preflight`, `review` and `verify` steps in a process of their own
-    (a lane's own checks set the engine's configuration). A lane writes to
-    <out>/<lane>/ and keeps its transcripts under $GOOSE_REVIEW_LOG_DIR/<lane>/;
-    its output lines are tagged with its name. A lane that fails stops
-    there and leaves the others running; `post` reports it."""
-    lanes = lanes_from_env()
-    out = Path(args.out)
-    logs = os.environ.get("GOOSE_REVIEW_LOG_DIR")
-    shared = [a for a in args.options if a != "--"]
+def run_lanes(lanes: list[dict], steps_for, logs: str | None) -> list[str]:
+    """Run each lane's steps (`steps_for(lane)`: argument lists of this
+    script's subcommands) in a process of their own, every lane at once,
+    each lane's output lines tagged with its name and its transcripts under
+    <logs>/<lane>/. A lane stops at its first failing step; the others go
+    on. Returns the lanes that failed."""
     me = [sys.executable, str(Path(__file__).resolve())]
     printing = threading.Lock()
 
@@ -1587,26 +1593,8 @@ def cmd_review_lanes(args: argparse.Namespace) -> None:
 
     def run_lane(lane: dict) -> bool:
         name = lane["lane"]
-        own = out / name
-        own.mkdir(parents=True, exist_ok=True)
-        status = str(own / "status.json")
         env = {**os.environ, **({"GOOSE_REVIEW_LOG_DIR": str(Path(logs, name))} if logs else {})}
-        context = ["--context", args.context] if args.context else []
-        providers = [p for k in ("provider", "verify-provider", "verify-backup-provider") if (p := lane[k])]
-        steps = [
-            ["preflight", *(a for p in providers for a in ("--provider", p)), "--status", status],
-            ["review", "--base", args.base, "--provider", lane["provider"], "--model", lane["model"],
-             "--jobs", str(lane["jobs"]), "--budget-minutes", str(args.budget_minutes), *context, *shared,
-             *(a for c in lane["checks"] for a in ("--check", c)),
-             "--out", str(own / "findings.jsonl"), "--status", status],
-            ["verify", "--base", args.base, "--provider", lane["verify-provider"], "--model", lane["verify-model"],
-             "--backup-provider", lane["verify-backup-provider"], "--backup-model", lane["verify-backup-model"],
-             "--budget-minutes", str(args.verify_budget_minutes), *context,
-             *(["--answered", args.answered] if args.answered else []), *shared,
-             "--in", str(own / "findings.jsonl"), "--out", str(own / "verified.jsonl"), "--status", status],
-        ]
-        say(name, f"{lane['model']} reviews, {lane['verify-model']} verifies")
-        for step in steps:
+        for step in steps_for(lane):
             proc = subprocess.Popen([*me, *step], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, errors="replace")
             for line in proc.stdout or []:
@@ -1616,12 +1604,87 @@ def cmd_review_lanes(args: argparse.Namespace) -> None:
                 return False
         return True
 
+    if not lanes:
+        return []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(lanes)) as pool:
         done = dict(zip((lane["lane"] for lane in lanes), pool.map(run_lane, lanes)))
     failed = [name for name, ok in done.items() if not ok]
     print(f"{len(lanes) - len(failed)} of {len(lanes)} lane(s) finished"
           + (f"; failed: {', '.join(failed)}" if failed else ""), file=sys.stderr)
-    if failed:
+    return failed
+
+
+def cmd_review_lanes(args: argparse.Namespace) -> None:
+    """The lanes' reviews, every lane given at once (the workflow gives each
+    review job one): each lane checks its provider and runs its checks with
+    its model, as the `preflight` and `review` steps, into <out>/<lane>/.
+    A lane's own checks set the engine's configuration, hence a process
+    each. A lane that fails stops alone; `post` reports it."""
+    lanes = lanes_from_env()
+    out = Path(args.out)
+    if args.fail:
+        # A step before the lanes stopped the job: each lane says why.
+        for lane in lanes:
+            write_status(str(out / lane["lane"] / "status.json"), error=args.fail)
+        raise SystemExit(f"::error::{args.fail}")
+    if not args.base:
+        raise SystemExit("review-lanes: --base is required")
+    shared = [a for a in args.options if a != "--"]
+    context = ["--context", args.context] if args.context else []
+
+    def steps(lane: dict) -> list[list[str]]:
+        own = out / lane["lane"]
+        own.mkdir(parents=True, exist_ok=True)
+        status = str(own / "status.json")
+        return [
+            ["preflight", "--provider", lane["provider"], "--status", status],
+            ["review", "--base", args.base, "--provider", lane["provider"], "--model", lane["model"],
+             "--jobs", str(lane["jobs"]), "--budget-minutes", str(args.budget_minutes), *context, *shared,
+             *(a for c in lane["checks"] for a in ("--check", c)),
+             "--out", str(own / "findings.jsonl"), "--status", status],
+        ]
+
+    if run_lanes(lanes, steps, os.environ.get("GOOSE_REVIEW_LOG_DIR")):
+        raise SystemExit(1)
+
+
+def cmd_verify_lanes(args: argparse.Namespace) -> None:
+    """Every lane's findings, verified by one model (and its backup) in one
+    job: the verifier's providers are checked once, then each lane with
+    findings (<dir>/<lane>/findings.jsonl) gets its own `verify` step, all
+    at once, writing verified.jsonl and adding to the lane's status. A lane
+    without findings did not review; there is nothing to verify, and
+    `post` reports it."""
+    lanes = lanes_from_env()
+    root = Path(args.dir)
+    shared = [a for a in args.options if a != "--"]
+    providers = [p for p in (args.provider, args.backup_provider) if p]
+    check = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "preflight",
+         *(a for p in providers for a in ("--provider", p)), "--status", os.devnull],
+    )
+    if check.returncode:
+        # Nothing verified: `post` withholds every lane's findings as
+        # unconfirmed rather than posting them.
+        raise SystemExit("::error::the verifier's provider did not answer; no finding is verified")
+    context = ["--context", args.context] if args.context else []
+    with_findings = [lane for lane in lanes if (root / lane["lane"] / "findings.jsonl").exists()]
+    for lane in lanes:
+        if lane not in with_findings:
+            print(f"::warning::lane {lane['lane']}: no findings file (its review did not run); nothing to verify", file=sys.stderr)
+
+    def steps(lane: dict) -> list[list[str]]:
+        own = root / lane["lane"]
+        return [[
+            "verify", "--base", args.base, "--provider", args.provider, "--model", args.model,
+            "--backup-provider", args.backup_provider, "--backup-model", args.backup_model,
+            "--budget-minutes", str(args.budget_minutes), *context,
+            *(["--answered", args.answered] if args.answered else []), *shared,
+            "--in", str(own / "findings.jsonl"), "--out", str(own / "verified.jsonl"),
+            "--status", str(own / "status.json"),
+        ]]
+
+    if run_lanes(with_findings, steps, os.environ.get("GOOSE_REVIEW_LOG_DIR")):
         raise SystemExit(1)
 
 
@@ -2118,15 +2181,15 @@ class LaneOutcome:
     meta: dict             # for its comments: lane, commit, models
 
 
-def read_lane(root: Path, lane: dict, head_sha: str) -> LaneOutcome:
-    """A lane's findings and status from <root>/<lane>/. A lane without a
-    status of its own takes the job's (<root>/status.json): a step before
-    any lane ran recorded why it stopped there."""
-    own = root / lane["lane"]
+def read_lane(roots: list[Path], lane: dict, head_sha: str, verify_model: str) -> LaneOutcome:
+    """A lane's findings and status from <root>/<lane>/, in the first root
+    that has it: the verify job's, then the lane's own review job's (whose
+    findings, unverified, are then withheld)."""
+    own = next((r / lane["lane"] for r in roots if (r / lane["lane"]).is_dir()), roots[0] / lane["lane"])
     verified, unverified = own / "verified.jsonl", own / "findings.jsonl"
     missing = not verified.exists()
     findings = [] if missing else read_findings(str(verified))
-    status = read_status(str(own / "status.json")) or read_status(str(root / "status.json"))
+    status = read_status(str(own / "status.json"))
     if missing and unverified.exists():
         # The review ran and wrote its findings; verification failed before
         # writing its own. Its findings are withheld as unconfirmed, not
@@ -2135,7 +2198,7 @@ def read_lane(root: Path, lane: dict, head_sha: str) -> LaneOutcome:
         status["withheld"] = len(read_findings(str(unverified)))
     # The models that actually verified (a backup, when the verifier's
     # provider was down); each comment names its own (`verified_by`).
-    verified_by = ", ".join(status.get("verified_by") or []) or lane["verify-model"]
+    verified_by = ", ".join(status.get("verified_by") or []) or verify_model
     return LaneOutcome(
         lane=lane, findings=findings, status=status, missing=missing,
         found=len(read_findings(str(unverified))) if unverified.exists() else None,
@@ -2251,7 +2314,7 @@ def cmd_post(args: argparse.Namespace) -> None:
         # Even a dry run: without the reviewed diff every finding would
         # preview as outside it.
         raise SystemExit("GH_TOKEN is not set")
-    outcomes = [read_lane(Path(args.dir), lane, args.head_sha) for lane in lanes_from_env()]
+    outcomes = [read_lane([Path(d) for d in args.dir], lane, args.head_sha, args.verify_model) for lane in lanes_from_env()]
     base = f"/repos/{args.repo}/pulls/{args.pr}"
 
     # The lines the review saw: the pull request at `head_sha` against its
@@ -2666,12 +2729,18 @@ HISTORY_RUNS = 20
 LEGACY_HISTORY_RE = re.compile(r"<!-- goose-review:history ([A-Za-z0-9+/=]*) -->")
 
 
-def job_kind(name: str) -> str:
-    """`review` or `post` for the run's review and post jobs, by the last
-    ` / ` part of their name: `review` of a caller's own wiring and
-    `goose-review / review` of the reusable workflow alike; else ""."""
-    last = name.split(" / ")[-1].strip()
-    return last if last in ("review", "post") else ""
+JOB_NAME_RE = re.compile(r"(review|verify|post)(?: \(([a-z0-9-]+)\))?")
+JOB_KINDS = ("review", "verify", "post")
+
+
+def job_kind(name: str) -> tuple[str, str]:
+    """(kind, lane) for the run's review, verify and post jobs, by the last
+    ` / ` part of their name: `review (deepseek)` is that lane's review
+    job, `review`, `verify` or `post` one every lane shares; a caller's own wiring and
+    `goose-review / review (deepseek)` of the reusable workflow alike.
+    ("", "") for any other job."""
+    m = JOB_NAME_RE.fullmatch(name.split(" / ")[-1].strip())
+    return (m.group(1), m.group(2) or "") if m else ("", "")
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
@@ -2692,8 +2761,8 @@ def cmd_summary(args: argparse.Namespace) -> None:
             continue
     token = os.environ.get("GH_TOKEN", "")
     lane_names = [lane["lane"] for lane in lanes_from_env()] if os.environ.get(LANES_ENV) else []
-    # The run's review and post jobs, which every lane shares.
-    jobs: dict[str, dict] = {}
+    # The run's review, verify and post jobs by kind, then by lane ("": every lane's).
+    jobs: dict[str, dict[str, dict]] = {}
     earlier: list[dict] = []
     old: list[dict] = []
     last_comment, last_review = None, ""
@@ -2705,9 +2774,10 @@ def cmd_summary(args: argparse.Namespace) -> None:
                       if args.state == "finished" else (0, None))
         if code == 200 and isinstance(data, dict):
             for job in data.get("jobs", []):
-                if kind := job_kind(job.get("name", "")):
+                kind, lane = job_kind(job.get("name", ""))
+                if kind:
                     # The post job writes the summary: it ends now.
-                    jobs[kind] = job if job.get("status") == "completed" else {**job, "completed_at": now}
+                    jobs.setdefault(kind, {})[lane] = job if job.get("status") == "completed" else {**job, "completed_at": now}
         everything = paged(comments, token)
         last_comment = max((c["id"] for c in everything), default=None)
         # Reviews are in the same timeline: a lane's review posted after the
@@ -2729,12 +2799,12 @@ def cmd_summary(args: argparse.Namespace) -> None:
         # Without a running entry (its step failed or never ran), the run
         # started when its first lane did.
         "state": args.state,
-        "started": this.get("started") or min((j["started_at"] for j in jobs.values() if j.get("started_at")), default=now),
+        "started": this.get("started") or min((j["started_at"] for by_lane in jobs.values() for j in by_lane.values() if j.get("started_at")), default=now),
         "finished": now if args.state == "finished" else None,
         "lanes": [] if args.state == "running"
         # A lane in $GOOSE_REVIEW_LANES without a result: the post job
         # stopped before writing it.
-        else [lane_row(lane, results.get(lane), jobs) for lane in sorted(set(results) | set(lane_names))],
+        else [lane_row(lane, results.get(lane), lane_jobs(jobs, lane)) for lane in sorted(set(results) | set(lane_names))],
     }
     # Runs of a pull request queue, so a run still marked running when a
     # newer one starts stopped before its summary step: it was cancelled by
@@ -2776,6 +2846,12 @@ def cmd_summary(args: argparse.Namespace) -> None:
     print(f"{verb} the summary ({data.get('html_url')}); {len(extra)} other summary comment(s) deleted")
 
 
+def lane_jobs(jobs: dict[str, dict[str, dict]], lane: str) -> dict[str, dict]:
+    """A lane's review, verify and post job: its own, else the one every lane shares."""
+    return {kind: by_lane[lane] if lane in by_lane else by_lane[""] for kind, by_lane in jobs.items()
+            if lane in by_lane or "" in by_lane}
+
+
 def read_history(body: str) -> list[dict]:
     found = markers(body, "history")
     legacy = LEGACY_HISTORY_RE.search(body)
@@ -2800,7 +2876,7 @@ def lane_row(lane: str, r: dict | None, j: dict[str, dict]) -> dict:
         "lane": lane,
         "started": review.get("started_at"),
         "ended": post.get("completed_at") or review.get("completed_at"),
-        "jobs": {k: v["html_url"] for k, v in (("review", review), ("post", post)) if v.get("html_url")},
+        "jobs": {k: j[k]["html_url"] for k in JOB_KINDS if j.get(k, {}).get("html_url")},
     }
     if r is None:
         # The review or post job failed or was cancelled before this lane's
@@ -2856,7 +2932,9 @@ def summary_rows(run: dict) -> list[tuple[str, list[str]]]:
         return [(run.get("started") or "", [commit, "—", "—", utc(run.get("started")), ended, "—", "—", "—", result, link])]
     rows = []
     for x in run["lanes"]:
-        jobs = " · ".join(f"[{k}]({u})" for k, u in sorted(x.get("jobs", {}).items(), reverse=True)) or link
+        # Run order; older rows may have other names.
+        order = {k: i for i, k in enumerate(JOB_KINDS)}
+        jobs = " · ".join(f"[{k}]({u})" for k, u in sorted(x.get("jobs", {}).items(), key=lambda kv: order.get(kv[0], 9))) or link
         started = x.get("started") or x.get("ran") or run.get("started")   # `ran`: summaries before this layout
         rows.append((started or "", [
             commit, code_cell(x["model"]) if x.get("model") else x["lane"], code_cell(x.get("verify")),
@@ -2942,20 +3020,35 @@ def main() -> None:
         p.add_argument("--rules-file", help="replaces the rules added to every check's and the verifier's prompt")
     verify.set_defaults(func=cmd_verify)
 
-    both = sub.add_parser("review-lanes", help="review and verify with every lane in $GOOSE_REVIEW_LANES at once")
-    both.add_argument("--base", required=True)
+    both = sub.add_parser("review-lanes", help="review with every lane in $GOOSE_REVIEW_LANES at once")
+    both.add_argument("--base", help="the base the lanes diff against; required unless --fail")
+    both.add_argument("--fail", help="review nothing: record this error as every lane's, and exit 1")
     both.add_argument("--context", help="file with the pull request title and description")
-    both.add_argument("--answered", help="answered findings from `answered`, for every lane's verifier")
     both.add_argument("--budget-minutes", type=float, default=35, help="each lane's wall-clock budget for its checks")
-    both.add_argument("--verify-budget-minutes", type=float, default=12, help="each lane's wall-clock budget for verification")
     both.add_argument("--out", required=True, help="a directory per lane is written here")
     both.add_argument("options", nargs=argparse.REMAINDER,
-                      help="after `--`: the review and verify options every lane shares (--checks-dir, --ignore, ...)")
+                      help="after `--`: the review options every lane shares (--checks-dir, --ignore, ...)")
     both.set_defaults(func=cmd_review_lanes)
+
+    vl = sub.add_parser("verify-lanes", help="verify every lane's findings with one model (and its backup)")
+    vl.add_argument("--dir", required=True, help="what review-lanes wrote: a directory per lane")
+    vl.add_argument("--base", required=True)
+    vl.add_argument("--provider", required=True, help="the verifier's provider")
+    vl.add_argument("--model", required=True, help="the verifier")
+    vl.add_argument("--backup-provider", default="", help="verifies instead when --model's provider is down")
+    vl.add_argument("--backup-model", default="")
+    vl.add_argument("--context", help="file with the pull request title and description")
+    vl.add_argument("--answered", help="answered findings from `answered`, so they are not raised again")
+    vl.add_argument("--budget-minutes", type=float, default=12, help="each lane's wall-clock budget for verification")
+    vl.add_argument("options", nargs=argparse.REMAINDER,
+                    help="after `--`: the verify options every lane shares (--checks-dir, --ignore, ...)")
+    vl.set_defaults(func=cmd_verify_lanes)
 
     lanes = sub.add_parser("lanes", help="read, check and normalise the lanes in $GOOSE_REVIEW_LANES (YAML or JSON)")
     lanes.add_argument("--checks-dir", default=".agents/checks", help="to check each lane's check names; skipped when missing")
     lanes.add_argument("--providers-dir", default=".github/goose/providers", help="to check each lane's providers; skipped when missing")
+    for flag in ("--verify-provider", "--verify-model", "--verify-backup-provider", "--verify-backup-model"):
+        lanes.add_argument(flag, default="", help="the verifier, checked too when given")
     lanes.set_defaults(func=cmd_lanes)
 
     tools = sub.add_parser("tools", help="read and check the tools in $GOOSE_REVIEW_TOOLS (YAML or JSON); install them")
@@ -2973,7 +3066,9 @@ def main() -> None:
     post.add_argument("--pr", required=True, type=int)
     post.add_argument("--head-sha", required=True)
     post.add_argument("--base-sha", required=True, help="the base the review diffed against")
-    post.add_argument("--dir", required=True, help="what review-lanes wrote: a directory per lane")
+    post.add_argument("--dir", required=True, action="append",
+                      help="a directory per lane (verify-lanes', then review-lanes'); repeatable, the first with a lane wins")
+    post.add_argument("--verify-model", required=True, help="the verifier, for the signature")
     post.add_argument("--dry-run", action="store_true", help="print the review instead of posting it")
     post.add_argument("--results", help="write each lane's result here, for `summary`")
     post.set_defaults(func=cmd_post)
