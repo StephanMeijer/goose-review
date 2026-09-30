@@ -165,12 +165,29 @@ class Lanes(Repo):
         self.assertEqual(len(self.read("a/verified.jsonl")), 1)
         self.assertIn("lane b: no findings file", done.stderr)
 
-    def test_no_verification_when_the_verifiers_provider_is_missing(self) -> None:
+    def test_no_verification_when_no_verifiers_provider_answers(self) -> None:
+        self.lanes([self.lane("a")])
+        for backup in ([], ["--backup-provider", "elsewhere", "--backup-model", "backup"]):
+            done = self.run_engine([self.lane("a")], "verify-lanes", "--dir", "out", "--base", "HEAD~1",
+                                   "--provider", "nowhere", "--model", "verifier", *backup)
+            self.assertEqual(done.returncode, 1)
+            self.assertFalse((self.repo / "out/a/verified.jsonl").exists())
+
+    def test_the_backup_verifies_alone_when_the_verifiers_provider_is_down(self) -> None:
         self.lanes([self.lane("a")])
         done = self.run_engine([self.lane("a")], "verify-lanes", "--dir", "out", "--base", "HEAD~1",
-                               "--provider", "nowhere", "--model", "verifier")
-        self.assertEqual(done.returncode, 1)
-        self.assertFalse((self.repo / "out/a/verified.jsonl").exists())
+                               "--provider", "nowhere", "--model", "verifier", "--backup-provider", "p", "--backup-model", "backup")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("backup verifies instead", done.stderr)
+        self.assertEqual(self.lane_status("a")["verified_by"], ["backup"])
+
+    def test_a_backup_that_does_not_answer_is_left_out(self) -> None:
+        self.lanes([self.lane("a")])
+        done = self.run_engine([self.lane("a")], "verify-lanes", "--dir", "out", "--base", "HEAD~1",
+                               "--provider", "p", "--model", "verifier", "--backup-provider", "elsewhere", "--backup-model", "backup")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("verifying without a backup", done.stderr)
+        self.assertEqual(len(self.read("a/verified.jsonl")), 1)
 
     def test_fail_records_the_error_for_every_lane(self) -> None:
         done = self.run_engine([self.lane("a"), self.lane("b")], "review-lanes", "--out", "out", "--fail", "no providers")

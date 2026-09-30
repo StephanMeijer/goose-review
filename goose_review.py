@@ -1650,7 +1650,8 @@ def cmd_review_lanes(args: argparse.Namespace) -> None:
 
 def cmd_verify_lanes(args: argparse.Namespace) -> None:
     """Every lane's findings, verified by one model (and its backup) in one
-    job: the verifier's providers are checked once, then each lane with
+    job: the verifier's providers are checked once (the backup verifies
+    alone when the verifier's is down), then each lane with
     findings (<dir>/<lane>/findings.jsonl) gets its own `verify` step, all
     at once, writing verified.jsonl and adding to the lane's status. A lane
     without findings did not review; there is nothing to verify, and
@@ -1658,15 +1659,22 @@ def cmd_verify_lanes(args: argparse.Namespace) -> None:
     lanes = lanes_from_env()
     root = Path(args.dir)
     shared = [a for a in args.options if a != "--"]
-    providers = [p for p in (args.provider, args.backup_provider) if p]
-    check = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "preflight",
-         *(a for p in providers for a in ("--provider", p)), "--status", os.devnull],
-    )
-    if check.returncode:
-        # Nothing verified: `post` withholds every lane's findings as
-        # unconfirmed rather than posting them.
-        raise SystemExit("::error::the verifier's provider did not answer; no finding is verified")
+    def answers(provider: str) -> bool:
+        return subprocess.run([sys.executable, str(Path(__file__).resolve()), "preflight",
+                               "--provider", provider, "--status", os.devnull]).returncode == 0
+
+    # The backup is there for a verifier whose provider is down: then it
+    # verifies alone. Without either, nothing is verified, and `post`
+    # withholds every lane's findings as unconfirmed rather than posting them.
+    verifier, backup = (args.provider, args.model), (args.backup_provider, args.backup_model)
+    if not answers(verifier[0]):
+        if not backup[0] or not answers(backup[0]):
+            raise SystemExit("::error::neither the verifier's provider nor the backup's answered; no finding is verified")
+        print(f"::warning::the verifier's provider {verifier[0]} did not answer; {backup[1]} verifies instead", file=sys.stderr)
+        verifier, backup = backup, ("", "")
+    elif backup[0] and backup[0] != verifier[0] and not answers(backup[0]):
+        print(f"::warning::the backup's provider {backup[0]} did not answer; verifying without a backup", file=sys.stderr)
+        backup = ("", "")
     context = ["--context", args.context] if args.context else []
     with_findings = [lane for lane in lanes if (root / lane["lane"] / "findings.jsonl").exists()]
     for lane in lanes:
@@ -1676,8 +1684,8 @@ def cmd_verify_lanes(args: argparse.Namespace) -> None:
     def steps(lane: dict) -> list[list[str]]:
         own = root / lane["lane"]
         return [[
-            "verify", "--base", args.base, "--provider", args.provider, "--model", args.model,
-            "--backup-provider", args.backup_provider, "--backup-model", args.backup_model,
+            "verify", "--base", args.base, "--provider", verifier[0], "--model", verifier[1],
+            "--backup-provider", backup[0], "--backup-model", backup[1],
             "--budget-minutes", str(args.budget_minutes), *context,
             *(["--answered", args.answered] if args.answered else []), *shared,
             "--in", str(own / "findings.jsonl"), "--out", str(own / "verified.jsonl"),
