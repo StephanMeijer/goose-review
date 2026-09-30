@@ -8,6 +8,9 @@
           keep only the ones it confirms;
   post    publish what is left as one GitHub pull request review.
 
+`review-lanes` runs review and verify for every lane at once, each lane
+with its own models; `post` then publishes all their findings together.
+
 Why not `goose review`: it runs each check with `--no-profile` and no
 extensions, so the model sees the diff and nothing else -- it cannot open a
 caller, a test or the project's specifications, and a model that tries to anyway ends
@@ -528,7 +531,7 @@ def parse_mappings(text: str, what: str, item: str) -> list[dict]:
 
 def validate_lanes(lanes: list[dict], checks: list[str] | None = None,
                    providers: list[str] | None = None) -> list[dict]:
-    """Every lane complete and well-formed, normalised for the matrix: all
+    """Every lane complete and well-formed, normalised: all
     keys present, `checks` a list and `jobs` a number. With the names of
     the caller's checks and provider templates, those are checked too."""
     if not lanes:
@@ -583,7 +586,7 @@ def validate_lanes(lanes: list[dict], checks: list[str] | None = None,
 def cmd_lanes(args: argparse.Namespace) -> None:
     """Read the caller's lanes (YAML or JSON) from $GOOSE_REVIEW_LANES,
     check them against the checks and provider templates, and write them
-    as JSON for the lane matrix: to $GITHUB_OUTPUT as `lanes`, or stdout."""
+    as JSON for the review and post actions: to $GITHUB_OUTPUT as `lanes`, or stdout."""
     checks_dir, providers_dir = Path(args.checks_dir), Path(args.providers_dir)
     checks = [c.name for c in load_checks(checks_dir)] if checks_dir.is_dir() else None
     providers = sorted(p.stem for p in providers_dir.glob("*.json")) if providers_dir.is_dir() else None
@@ -1545,6 +1548,83 @@ def cmd_preflight(args: argparse.Namespace) -> None:
         raise SystemExit(f"::error::{why}")
 
 
+LANES_ENV = "GOOSE_REVIEW_LANES"
+# The workflow commands a lane's line may carry; they stay at the start of
+# the line, with the lane's name after them.
+WORKFLOW_COMMAND_RE = re.compile(r"(::(?:error|warning|notice|debug)(?: [^:]*)?::)(.*)")
+
+
+def lanes_from_env() -> list[dict]:
+    """The lanes in $GOOSE_REVIEW_LANES (YAML or JSON), checked, or exit
+    with the errors shown."""
+    try:
+        return validate_lanes(parse_lanes(os.environ.get(LANES_ENV, "")))
+    except LanesError as error:
+        for line in str(error).splitlines():
+            print(f"::error::{line}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def cmd_review_lanes(args: argparse.Namespace) -> None:
+    """Every lane in one job, at once: each checks its providers, runs its
+    checks with its model and has its verifier re-check the findings, as
+    the `preflight`, `review` and `verify` steps in a process of their own
+    (a lane's own checks set the engine's configuration). A lane writes to
+    <out>/<lane>/ and keeps its transcripts under $GOOSE_REVIEW_LOG_DIR/<lane>/;
+    its output lines are tagged with its name. A lane that fails stops
+    there and leaves the others running; `post` reports it."""
+    lanes = lanes_from_env()
+    out = Path(args.out)
+    logs = os.environ.get("GOOSE_REVIEW_LOG_DIR")
+    shared = [a for a in args.options if a != "--"]
+    me = [sys.executable, str(Path(__file__).resolve())]
+    printing = threading.Lock()
+
+    def say(name: str, line: str) -> None:
+        m = WORKFLOW_COMMAND_RE.fullmatch(line)
+        with printing:
+            print(f"{m.group(1)}{name}: {m.group(2)}" if m else f"[{name}] {line}", flush=True)
+
+    def run_lane(lane: dict) -> bool:
+        name = lane["lane"]
+        own = out / name
+        own.mkdir(parents=True, exist_ok=True)
+        status = str(own / "status.json")
+        env = {**os.environ, **({"GOOSE_REVIEW_LOG_DIR": str(Path(logs, name))} if logs else {})}
+        context = ["--context", args.context] if args.context else []
+        providers = [p for k in ("provider", "verify-provider", "verify-backup-provider") if (p := lane[k])]
+        steps = [
+            ["preflight", *(a for p in providers for a in ("--provider", p)), "--status", status],
+            ["review", "--base", args.base, "--provider", lane["provider"], "--model", lane["model"],
+             "--jobs", str(lane["jobs"]), "--budget-minutes", str(args.budget_minutes), *context, *shared,
+             *(a for c in lane["checks"] for a in ("--check", c)),
+             "--out", str(own / "findings.jsonl"), "--status", status],
+            ["verify", "--base", args.base, "--provider", lane["verify-provider"], "--model", lane["verify-model"],
+             "--backup-provider", lane["verify-backup-provider"], "--backup-model", lane["verify-backup-model"],
+             "--budget-minutes", str(args.verify_budget_minutes), *context,
+             *(["--answered", args.answered] if args.answered else []), *shared,
+             "--in", str(own / "findings.jsonl"), "--out", str(own / "verified.jsonl"), "--status", status],
+        ]
+        say(name, f"{lane['model']} reviews, {lane['verify-model']} verifies")
+        for step in steps:
+            proc = subprocess.Popen([*me, *step], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, errors="replace")
+            for line in proc.stdout or []:
+                say(name, line.rstrip("\n"))
+            if code := proc.wait():
+                say(name, f"::warning::{step[0]} failed (exit {code}); the lane stops here")
+                return False
+        return True
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(lanes)) as pool:
+        done = dict(zip((lane["lane"] for lane in lanes), pool.map(run_lane, lanes)))
+    failed = [name for name, ok in done.items() if not ok]
+    print(f"{len(lanes) - len(failed)} of {len(lanes)} lane(s) finished"
+          + (f"; failed: {', '.join(failed)}" if failed else ""), file=sys.stderr)
+    if failed:
+        raise SystemExit(1)
+
+
 def cmd_verify(args: argparse.Namespace) -> None:
     configure(args)
     findings = read_findings(args.input)
@@ -2027,188 +2107,267 @@ def body_line(f: dict, where: str) -> str:
     return line + "".join(f"\n  - **{a['severity']}** · `{a['check']}`: {a['summary']}" for a in f.get("also", []))
 
 
-def cmd_post(args: argparse.Namespace) -> None:
-    # No verified findings at all: the review job failed before writing them.
-    missing = not Path(args.input).exists()
-    findings = [] if missing else read_findings(args.input)
-    status = read_status(args.status)
-    unverified = Path(args.input).with_name("findings.jsonl")
+@dataclass
+class LaneOutcome:
+    """One lane's part of the review job's artifact, as `post` reads it."""
+    lane: dict
+    findings: list[dict]   # confirmed by the verifier
+    status: dict
+    missing: bool          # the lane left no findings at all: it did not run
+    found: int | None      # what its own model raised, before verification
+    meta: dict             # for its comments: lane, commit, models
+
+
+def read_lane(root: Path, lane: dict, head_sha: str) -> LaneOutcome:
+    """A lane's findings and status from <root>/<lane>/. A lane without a
+    status of its own takes the job's (<root>/status.json): a step before
+    any lane ran recorded why it stopped there."""
+    own = root / lane["lane"]
+    verified, unverified = own / "verified.jsonl", own / "findings.jsonl"
+    missing = not verified.exists()
+    findings = [] if missing else read_findings(str(verified))
+    status = read_status(str(own / "status.json")) or read_status(str(root / "status.json"))
     if missing and unverified.exists():
         # The review ran and wrote its findings; verification failed before
         # writing its own. Its findings are withheld as unconfirmed, not
         # reported as a review that never ran.
         missing = False
         status["withheld"] = len(read_findings(str(unverified)))
-    token = os.environ.get("GH_TOKEN", "")
-    if not token:
-        # Even a dry run: without the reviewed diff every finding would
-        # preview as outside it.
-        raise SystemExit("GH_TOKEN is not set")
-    base = f"/repos/{args.repo}/pulls/{args.pr}"
     # The models that actually verified (a backup, when the verifier's
     # provider was down); each comment names its own (`verified_by`).
-    verified_by = ", ".join(status.get("verified_by") or []) or args.verify_model
-    meta = {"lane": args.lane, "commit": args.head_sha, "model": args.model, "verify_model": verified_by}
+    verified_by = ", ".join(status.get("verified_by") or []) or lane["verify-model"]
+    return LaneOutcome(
+        lane=lane, findings=findings, status=status, missing=missing,
+        found=len(read_findings(str(unverified))) if unverified.exists() else None,
+        meta={"lane": lane["lane"], "commit": head_sha, "model": lane["model"], "verify_model": verified_by},
+    )
 
-    # The lines the review saw: the pull request at `head_sha` against its
-    # base, as the review job diffed it, not the live pull request, which a
-    # push since may have moved. The review is anchored to `head_sha` too.
-    files = compare_files(args.repo, args.base_sha, args.head_sha, token)
-    diff_lines = {f["filename"]: commentable_lines(f.get("patch") or "") for f in files}
 
-    # Other checks' notes on the same lines are posted as replies in the
-    # lead comment's thread once the review exists; `threads` pairs each
-    # inline comment with them.
-    # A finding on lines where a lane thread is still open (this lane's from
-    # an earlier commit, or another lane's) is posted as a reply in that
-    # thread: one conversation per problem, not one per model and push.
-    open_on = open_threads(args.repo, args.pr, token)
-    merged: list[tuple[dict, dict]] = []
-    comments, loose, threads, inline = [], [], [], []
-    for f in findings:
-        lines = diff_lines.get(f["path"], {})
-        end, start = f["line_end"], f["line_start"]
-        if end not in lines:
-            loose.append(f)
-            continue
-        target = next((
-            t for t in open_on
-            if t["path"] == f["path"] and (t.get("startLine") or t["line"]) <= end and start <= t["line"]
-        ), None)
-        if target:
-            merged.append((f, target))
-            continue
-        comment = {"path": f["path"], "line": end, "side": "RIGHT", "body": comment_body(f, meta, AGENT_NOTE)}
-        if start < end and lines.get(start) == lines[end]:
-            comment.update(start_line=start, start_side="RIGHT")
-        comments.append(comment)
-        threads.append(f.get("also", []))
-        inline.append(f)
-
+def lane_headline(o: LaneOutcome) -> str:
+    """How a lane went, in a few words, for the summary."""
+    status, findings = o.status, o.findings
     ran, failed = status.get("checks_run"), status.get("checks_failed") or []
     counts = {s: sum(f["severity"] == s for f in findings) for s in SEVERITIES}
     tally = ", ".join(f"{n} {s}" for s, n in reversed(counts.items()) if n) or "no findings"
     if status.get("error"):
         # A step before the review recorded why it stopped (the proxy did
         # not answer, a secret was missing).
-        headline = f"the review did not run: {status['error']}"
-    elif missing:
-        headline = "the review did not run: its job failed (see the workflow log)"
-    elif ran == [] and status.get("checks_skipped"):
-        headline = "no check covers the files this pull request changes"
-    elif ran and len(failed) == len(ran) and not findings:
+        return f"the review did not run: {status['error']}"
+    if o.missing:
+        return "the review did not run: its job failed (see the workflow log)"
+    if ran == [] and status.get("checks_skipped"):
+        return "no check covers the files this pull request changes"
+    if ran and len(failed) == len(ran) and not findings:
         # A check counts as failed when any of its diff's batches did; with
         # findings from its other batches, it did run.
-        headline = "the review did not run: no check finished (see the workflow log)"
-    elif findings:
-        headline = f"{tally}, each confirmed by a second model"
-    elif status.get("withheld"):
+        return "the review did not run: no check finished (see the workflow log)"
+    if findings:
+        return f"{tally}, each confirmed by a second model"
+    if status.get("withheld"):
         # Nothing confirmed because nothing was checked, not because the
         # change is clean.
-        headline = "no confirmed findings: verification did not finish"
-    else:
-        headline = tally
+        return "no confirmed findings: verification did not finish"
+    return tally
+
+
+@dataclass
+class Placed:
+    """Where each lane's findings go on the pull request."""
+    # New threads, in the review: each `members` [(finding, meta)], the
+    # first opening the thread and the others (other lanes' findings on the
+    # same lines) replying in it.
+    threads: list[dict]
+    loose: list[tuple[dict, dict]]              # outside the diff: in the review's body
+    into_open: list[tuple[dict, dict, dict]]    # (finding, meta, open thread) on lines already under discussion
+
+
+def place_findings(outcomes: list[LaneOutcome], diff_lines: dict[str, dict[int, int]], open_on: list[dict]) -> Placed:
+    """Every lane's findings, most severe first, placed: one conversation
+    per problem, not one per model and push. A finding on lines where a
+    lane thread is still open (from an earlier run) is a reply there; one
+    on or within two lines of another lane's finding that opens a thread in
+    this review is a reply in that thread; one outside the diff's lines
+    goes in the review's body."""
+    order = {o.lane["lane"]: i for i, o in enumerate(outcomes)}
+    entries = sorted(
+        ((f, o.meta) for o in outcomes for f in o.findings),
+        key=lambda e: (-SEVERITIES.index(e[0]["severity"]), order[e[1]["lane"]], e[0]["path"], e[0]["line_start"]),
+    )
+    placed = Placed([], [], [])
+    for f, meta in entries:
+        lines = diff_lines.get(f["path"], {})
+        start, end = f["line_start"], f["line_end"]
+        if end not in lines:
+            placed.loose.append((f, meta))
+            continue
+        target = next((
+            t for t in open_on
+            if t["path"] == f["path"] and (t.get("startLine") or t["line"]) <= end and start <= t["line"]
+        ), None)
+        if target:
+            placed.into_open.append((f, meta, target))
+            continue
+        # The same place as `merge_overlapping` takes it: overlapping, or
+        # within two lines.
+        same = next((t for t in placed.threads
+                     if t["path"] == f["path"] and t["start"] - 2 <= end and start <= t["end"] + 2), None)
+        if same:
+            same["members"].append((f, meta))
+            continue
+        comment = {"path": f["path"], "line": end, "side": "RIGHT", "body": comment_body(f, meta, AGENT_NOTE)}
+        if start < end and lines.get(start) == lines[end]:
+            comment.update(start_line=start, start_side="RIGHT")
+        placed.threads.append({"path": f["path"], "start": start, "end": end, "comment": comment, "members": [(f, meta)]})
+    return placed
+
+
+def thread_replies(members: list[tuple[dict, dict]]) -> list[str]:
+    """The replies under a new thread's first comment: that finding's other
+    checks' notes, then each other lane's finding with its own notes."""
+    replies = []
+    for i, (f, meta) in enumerate(members):
+        if i:
+            replies.append(comment_body(f, meta))
+        replies += [comment_body(at_lead(a, f), meta) for a in f.get("also", [])]
+    return replies
+
+
+def body_blocks(items: list[tuple[dict, dict, str]], outcomes: list[LaneOutcome]) -> list[str]:
+    """Findings as review-body bullets (`where` each), grouped by lane,
+    each lane's closed by its signature."""
+    lines: list[str] = []
+    for o in outcomes:
+        mine = [(f, where) for f, meta, where in items if meta["lane"] == o.lane["lane"]]
+        if mine:
+            lines += [body_line(f, where) for f, where in mine] + ["", footer(o.meta), ""]
+    return lines
+
+
+def cmd_post(args: argparse.Namespace) -> None:
+    """Every lane's confirmed findings as one pull request review, and each
+    lane's result for `summary`."""
+    token = os.environ.get("GH_TOKEN", "")
+    if not token:
+        # Even a dry run: without the reviewed diff every finding would
+        # preview as outside it.
+        raise SystemExit("GH_TOKEN is not set")
+    outcomes = [read_lane(Path(args.dir), lane, args.head_sha) for lane in lanes_from_env()]
+    base = f"/repos/{args.repo}/pulls/{args.pr}"
+
+    # The lines the review saw: the pull request at `head_sha` against its
+    # base, as the review job diffed it, not the live pull request, which a
+    # push since may have moved. The review is anchored to `head_sha` too.
+    files = compare_files(args.repo, args.base_sha, args.head_sha, token)
+    diff_lines = {f["filename"]: commentable_lines(f.get("patch") or "") for f in files}
+    placed = place_findings(outcomes, diff_lines, open_threads(args.repo, args.pr, token))
+
     # The review's body holds only findings that cannot sit on the code: how
-    # the lane went (headline, checks not covered, findings withheld) is
-    # the summary comment's. The lane marker is an HTML comment, so a review
+    # each lane went (headline, checks not covered, findings withheld) is
+    # the summary comment's. The lane markers are HTML comments, so a review
     # with every finding inline shows no body at all.
-    body = [marker("lane", name=args.lane, commit=args.head_sha, model=args.model, verify_model=verified_by)]
-    if loose:
-        body.append("Outside the diff's changed lines:\n")
-        body += [body_line(f, f"{f['path']}:{f['line_start']}") for f in loose]
-    closing = ["", footer(meta)] if loose else []
-    review = {"commit_id": args.head_sha, "event": "COMMENT", "body": "\n".join([*body, *closing]), "comments": comments}
-    # A lane posts a review only to show findings on the code. How every
-    # lane went -- clean, not covered, withheld, did not run -- is reported
-    # once, in the run's summary comment (`summary`), from the result file
-    # written here; a failure is never silent, and a PR does not collect a
-    # status review per lane per push.
-    noteworthy = bool(findings)
-    result = {
-        "lane": args.lane, "model": args.model, "verify_model": verified_by,
-        "headline": headline, "counts": counts, "loose": len(loose), "merged": len(merged),
-        "repeated": status.get("repeated") or 0,
-        "unevidenced": status.get("unevidenced") or 0, "downgraded": status.get("downgraded") or 0,
-        "checks_run": ran or [], "checks_failed": failed, "checks_skipped": status.get("checks_skipped") or [],
-        "checks_unstarted": status.get("checks_unstarted") or {},
-        "rejected": status.get("rejected") or 0, "withheld": status.get("withheld") or 0,
-        "did_not_run": bool(missing or status.get("error")), "review_url": None, "post_error": None,
-        # Before verification (after merging overlaps): what the lane's own
-        # model raised, whatever the verifier then made of it.
-        "found": len(read_findings(str(unverified))) if unverified.exists() else None,
-    }
+    head = [marker("lane", name=o.meta["lane"], commit=args.head_sha, model=o.meta["model"], verify_model=o.meta["verify_model"])
+            for o in outcomes]
+    loose = [(f, meta, f"{f['path']}:{f['line_start']}") for f, meta in placed.loose]
+    body = head + (["Outside the diff's changed lines:\n", *body_blocks(loose, outcomes)] if loose else [])
+    review = {"commit_id": args.head_sha, "event": "COMMENT", "body": "\n".join(body).rstrip() + "\n",
+              "comments": [t["comment"] for t in placed.threads]}
+
+    results = {}
+    for o in outcomes:
+        name, status = o.meta["lane"], o.status
+        results[name] = {
+            "lane": name, "model": o.meta["model"], "verify_model": o.meta["verify_model"],
+            "headline": lane_headline(o), "counts": {s: sum(f["severity"] == s for f in o.findings) for s in SEVERITIES},
+            "loose": sum(meta["lane"] == name for _, meta in placed.loose),
+            "merged": sum(meta["lane"] == name for _, meta, _ in placed.into_open),
+            "repeated": status.get("repeated") or 0,
+            "unevidenced": status.get("unevidenced") or 0, "downgraded": status.get("downgraded") or 0,
+            "checks_run": status.get("checks_run") or [], "checks_failed": status.get("checks_failed") or [],
+            "checks_skipped": status.get("checks_skipped") or [], "checks_unstarted": status.get("checks_unstarted") or {},
+            "rejected": status.get("rejected") or 0, "withheld": status.get("withheld") or 0,
+            "did_not_run": bool(o.missing or status.get("error")), "review_url": None, "post_error": None,
+            # Before verification (after merging overlaps): what the lane's own
+            # model raised, whatever the verifier then made of it.
+            "found": o.found,
+        }
+
+    # The lanes with a finding in the review itself (not only in open
+    # threads): the ones its link and a failure to post it are about.
+    in_review = {meta["lane"] for t in placed.threads for _, meta in t["members"]} | {meta["lane"] for _, meta in placed.loose}
 
     def save(**fields: object) -> None:
-        result.update(fields)
-        if args.result:
-            Path(args.result).parent.mkdir(parents=True, exist_ok=True)
-            Path(args.result).write_text(json.dumps(result, indent=2), encoding="utf-8")
+        for name, result in results.items():
+            if name in in_review:
+                result.update(fields)
+            if args.results:
+                Path(args.results).mkdir(parents=True, exist_ok=True)
+                Path(args.results, f"{name}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
 
-    summary = f"### Goose review ({args.lane}, `{args.model}`)\n\n{headline}.\n"
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
-            out.write(summary + ("" if noteworthy else "\nNo review posted; see the summary comment.\n"))
+            for o in outcomes:
+                out.write(f"### Goose review ({o.meta['lane']}, `{o.meta['model']}`)\n\n{results[o.meta['lane']]['headline']}.\n\n")
     save()
 
+    # A review is posted only to show findings on the code. How every lane
+    # went -- clean, not covered, withheld, did not run -- is reported once,
+    # in the run's summary comment (`summary`), from the result files
+    # written here; a failure is never silent, and a PR does not collect a
+    # status review per push.
+    noteworthy = any(o.findings for o in outcomes)
     if args.dry_run:
         if not noteworthy:
-            print(f"nothing to post: {headline}")
+            print("nothing to post: no lane has a confirmed finding")
             return
         planned = [
-            {"reply_to": f"{c['path']}:{c['line']}", "body": comment_body(at_lead(a, f), meta)}
-            for c, f, also in zip(comments, inline, threads)
-            for a in also
+            {"reply_to": f"{t['comment']['path']}:{t['comment']['line']}", "body": body}
+            for t in placed.threads for body in thread_replies(t["members"])
         ]
         into_open = [
-            {"reply_to_thread": t["id"], "at": f"{t['path']}:{t['line']}", "body": comment_body(f, meta)}
-            for f, t in merged
+            {"reply_to_thread": t["id"], "at": f"{t['path']}:{t['line']}", "body": comment_body(note, meta)}
+            for f, meta, t in placed.into_open for note in [f, *(at_lead(a, f) for a in f.get("also", []))]
         ]
         print(json.dumps({**review, "thread_replies": planned, "open_thread_replies": into_open}, indent=2))
         return
-    if not token:
-        raise SystemExit("GH_TOKEN is not set")
 
     if not noteworthy:
         collapsed = collapse_resolved(args.repo, args.pr, token)
-        print(f"nothing to post ({headline}); {collapsed} resolved item(s) collapsed")
+        print(f"nothing to post: no lane has a confirmed finding; {collapsed} resolved item(s) collapsed")
         return
 
     # Into the open threads first: they need no new review.
     merged_ok = 0
-    for f, t in merged:
+    for f, meta, t in placed.into_open:
         for note in [f, *(at_lead(a, f) for a in f.get("also", []))]:
             code, reply = github("POST", f"{base}/comments/{t['all'][0]['databaseId']}/replies", token, {"body": comment_body(note, meta)})
             if code in (200, 201):
                 merged_ok += 1
             else:
                 print(f"::warning::reply in the open thread at {t['path']}:{t['line']} failed: {code} {reply}", file=sys.stderr)
-    if not comments and not loose:
-        save()
+    if not placed.threads and not placed.loose:
         collapsed = collapse_resolved(args.repo, args.pr, token)
         print(f"every finding went to an open thread ({merged_ok} repl(ies)); no review posted; {collapsed} resolved item(s) collapsed")
         return
 
-    # Every finding the review carries, for a PR comment should the review
-    # itself not post (see below).
-    everything = [*inline, *loose]
+    # Every finding the review carries, for its body should the inline
+    # comments or the review itself not post (see below).
+    anchored = [(f, meta, f"{f['path']}:{f['line_end']}") for t in placed.threads for f, meta in t["members"]]
+    threads = placed.threads
     status, data = github("POST", f"{base}/reviews", token, review)
-    if status == 422 and comments:
+    if status == 422 and threads:
         # A line GitHub will not anchor to: post everything in the body instead.
         print(f"::warning::inline review rejected ({data}); posting findings in the review body", file=sys.stderr)
-        anchored = inline
-        # Above the footer, as in any other review: the signature closes it.
-        review["body"] = "\n".join([*body, "", *(body_line(f, f"{f['path']}:{f['line_end']}") for f in anchored), "", footer(meta)])
+        review["body"] = "\n".join([*head, *body_blocks(loose + anchored, outcomes)]).rstrip() + "\n"
         review["comments"] = []
-        comments, threads, inline = [], [], []
+        threads = []
         status, data = github("POST", f"{base}/reviews", token, review)
     if status not in (200, 201):
         # The findings are in no other request: a PR comment carries them
         # rather than losing them (a body too large for a review, a 500),
         # and the failure is still reported as one.
         text = "\n".join([
-            marker("lane", name=args.lane, commit=args.head_sha, model=args.model, verify_model=verified_by),
-            f"The review could not be posted (HTTP {status}); its findings:\n",
-            *(body_line(f, f"{f['path']}:{f['line_end']}") for f in everything), "", footer(meta),
+            *head, f"The review could not be posted (HTTP {status}); its findings:\n",
+            *body_blocks(anchored + loose, outcomes),
         ])
         code, _ = github("POST", f"/repos/{args.repo}/issues/{args.pr}/comments", token, {"body": clip(text, 65_000)})
         kept = "; its findings are in a PR comment" if code in (200, 201) else ""
@@ -2217,22 +2376,22 @@ def cmd_post(args: argparse.Namespace) -> None:
     save(review_url=data.get("html_url"))
 
     replies = 0
-    if any(threads):
+    if any(len(t["members"]) > 1 or t["members"][0][0].get("also") for t in threads):
         posted = paged(f"{base}/reviews/{data['id']}/comments", token)
         by_place = {(c["path"], c.get("line") or c.get("original_line")): c["id"] for c in posted}
-        for comment, f, also in zip(comments, inline, threads):
-            parent = by_place.get((comment["path"], comment["line"]))
-            for a in also if parent else []:
-                reply_status, reply = github("POST", f"{base}/comments/{parent}/replies", token, {"body": comment_body(at_lead(a, f), meta)})
+        for t in threads:
+            parent = by_place.get((t["comment"]["path"], t["comment"]["line"]))
+            for reply_body in thread_replies(t["members"]) if parent else []:
+                reply_status, reply = github("POST", f"{base}/comments/{parent}/replies", token, {"body": reply_body})
                 if reply_status in (200, 201):
                     replies += 1
                 else:
-                    print(f"::warning::reply to {comment['path']}:{comment['line']} failed: {reply_status} {reply}", file=sys.stderr)
+                    print(f"::warning::reply to {t['path']}:{t['comment']['line']} failed: {reply_status} {reply}", file=sys.stderr)
     # Threads resolved while this run reviewed, of any lane or commit.
     collapsed = collapse_resolved(args.repo, args.pr, token)
     print(
-        f"posted review with {len(comments)} inline comment(s) and {replies} thread repl(ies), "
-        f"{len(loose)} in the body, {merged_ok} repl(ies) in open threads, {collapsed} resolved item(s) collapsed"
+        f"posted one review for {len(outcomes)} lane(s): {len(threads)} inline comment(s) and {replies} thread repl(ies), "
+        f"{len(placed.loose)} in the body, {merged_ok} repl(ies) in open threads, {collapsed} resolved item(s) collapsed"
     )
 
 
@@ -2507,18 +2666,12 @@ HISTORY_RUNS = 20
 LEGACY_HISTORY_RE = re.compile(r"<!-- goose-review:history ([A-Za-z0-9+/=]*) -->")
 
 
-def job_lane(name: str) -> tuple[str, str]:
-    """(lane, kind) from a lane job's name, its last two ` / ` parts: both
-    `deepseek / review` (a caller's own lane workflow) and `goose-review /
-    3 deepseek / review → post` (nested in the reusable workflow, numbered
-    by stage so it sorts in run order) match. `post` may be named `review →
-    post`; the lane may carry a stage number."""
-    parts = name.split(" / ")
-    if len(parts) < 2:
-        return "", ""
-    lane = re.sub(r"^\d+\s+", "", parts[-2])
-    kind = "post" if parts[-1].endswith("post") else parts[-1]
-    return lane, kind
+def job_kind(name: str) -> str:
+    """`review` or `post` for the run's review and post jobs, by the last
+    ` / ` part of their name: `review` of a caller's own wiring and
+    `goose-review / review` of the reusable workflow alike; else ""."""
+    last = name.split(" / ")[-1].strip()
+    return last if last in ("review", "post") else ""
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
@@ -2527,6 +2680,8 @@ def cmd_summary(args: argparse.Namespace) -> None:
     result or why it failed, links to the jobs), and the earlier runs below
     it. The history travels in the comment itself; the previous summary is
     deleted once the new one exists, so the latest is always the last one."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     results: dict[str, dict] = {}
     # `tidy` passes none: Path("") would be the working directory.
     for path in sorted(Path(args.results).glob("*.json")) if args.results else []:
@@ -2536,7 +2691,9 @@ def cmd_summary(args: argparse.Namespace) -> None:
         except (OSError, ValueError, KeyError):
             continue
     token = os.environ.get("GH_TOKEN", "")
-    jobs: dict[str, dict[str, dict]] = {}
+    lane_names = [lane["lane"] for lane in lanes_from_env()] if os.environ.get(LANES_ENV) else []
+    # The run's review and post jobs, which every lane shares.
+    jobs: dict[str, dict] = {}
     earlier: list[dict] = []
     old: list[dict] = []
     last_comment, last_review = None, ""
@@ -2548,9 +2705,9 @@ def cmd_summary(args: argparse.Namespace) -> None:
                       if args.state == "finished" else (0, None))
         if code == 200 and isinstance(data, dict):
             for job in data.get("jobs", []):
-                lane, kind = job_lane(job.get("name", ""))
-                if kind in ("review", "post"):
-                    jobs.setdefault(lane, {})[kind] = job
+                if kind := job_kind(job.get("name", "")):
+                    # The post job writes the summary: it ends now.
+                    jobs[kind] = job if job.get("status") == "completed" else {**job, "completed_at": now}
         everything = paged(comments, token)
         last_comment = max((c["id"] for c in everything), default=None)
         # Reviews are in the same timeline: a lane's review posted after the
@@ -2565,8 +2722,6 @@ def cmd_summary(args: argparse.Namespace) -> None:
         for c in sorted(old, key=lambda c: c["id"], reverse=True):
             if earlier := read_history(c.get("body") or ""):
                 break
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     this = next((r for r in earlier if r.get("run") == str(args.run_id)), {})
     run = {
         "run": str(args.run_id), "sha": args.head_sha[:7],
@@ -2574,10 +2729,12 @@ def cmd_summary(args: argparse.Namespace) -> None:
         # Without a running entry (its step failed or never ran), the run
         # started when its first lane did.
         "state": args.state,
-        "started": this.get("started") or min((j["started_at"] for lj in jobs.values() for j in lj.values() if j.get("started_at")), default=now),
+        "started": this.get("started") or min((j["started_at"] for j in jobs.values() if j.get("started_at")), default=now),
         "finished": now if args.state == "finished" else None,
         "lanes": [] if args.state == "running"
-        else [lane_row(lane, results.get(lane), jobs.get(lane, {})) for lane in sorted(set(results) | set(jobs))],
+        # A lane in $GOOSE_REVIEW_LANES without a result: the post job
+        # stopped before writing it.
+        else [lane_row(lane, results.get(lane), jobs) for lane in sorted(set(results) | set(lane_names))],
     }
     # Runs of a pull request queue, so a run still marked running when a
     # newer one starts stopped before its summary step: it was cancelled by
@@ -2646,7 +2803,8 @@ def lane_row(lane: str, r: dict | None, j: dict[str, dict]) -> dict:
         "jobs": {k: v["html_url"] for k, v in (("review", review), ("post", post)) if v.get("html_url")},
     }
     if r is None:
-        # A run cancelled by hand can stop a lane before its post job.
+        # The review or post job failed or was cancelled before this lane's
+        # result was written.
         kind, job = ("post", post) if post else ("review", review)
         conclusion = job.get("conclusion") or ""
         why = {"failure": "failed", "cancelled": "was cancelled", "skipped": "was skipped"}.get(conclusion, "did not report")
@@ -2737,8 +2895,8 @@ def summary_body(history: list[dict], answers: str = "") -> str:
         summary_table(kept[:1]),
         "",
         *every,
-        "<sub>**Found**: what the model raised; **Posted**: what a second model then confirmed, posted as that model's "
-        "review on the code. Checks: ✅ finished · ⚠️ did not finish, so not covered. Result: ❌ did not run. "
+        "<sub>**Found**: what the model raised; **Posted**: what a second model then confirmed, posted on the code "
+        "in the run's review, each comment signed by its models. Checks: ✅ finished · ⚠️ did not finish, so not covered. Result: ❌ did not run. "
         "Advisory only; it never blocks merging.</sub>",
         "",
         answers,
@@ -2784,6 +2942,17 @@ def main() -> None:
         p.add_argument("--rules-file", help="replaces the rules added to every check's and the verifier's prompt")
     verify.set_defaults(func=cmd_verify)
 
+    both = sub.add_parser("review-lanes", help="review and verify with every lane in $GOOSE_REVIEW_LANES at once")
+    both.add_argument("--base", required=True)
+    both.add_argument("--context", help="file with the pull request title and description")
+    both.add_argument("--answered", help="answered findings from `answered`, for every lane's verifier")
+    both.add_argument("--budget-minutes", type=float, default=35, help="each lane's wall-clock budget for its checks")
+    both.add_argument("--verify-budget-minutes", type=float, default=12, help="each lane's wall-clock budget for verification")
+    both.add_argument("--out", required=True, help="a directory per lane is written here")
+    both.add_argument("options", nargs=argparse.REMAINDER,
+                      help="after `--`: the review and verify options every lane shares (--checks-dir, --ignore, ...)")
+    both.set_defaults(func=cmd_review_lanes)
+
     lanes = sub.add_parser("lanes", help="read, check and normalise the lanes in $GOOSE_REVIEW_LANES (YAML or JSON)")
     lanes.add_argument("--checks-dir", default=".agents/checks", help="to check each lane's check names; skipped when missing")
     lanes.add_argument("--providers-dir", default=".github/goose/providers", help="to check each lane's providers; skipped when missing")
@@ -2799,21 +2968,17 @@ def main() -> None:
     ans.add_argument("--out", required=True)
     ans.set_defaults(func=cmd_answered)
 
-    post = sub.add_parser("post", help="publish findings as a pull request review")
+    post = sub.add_parser("post", help="publish every lane's findings (lanes in $GOOSE_REVIEW_LANES) as one pull request review")
     post.add_argument("--repo", required=True, help="owner/name")
     post.add_argument("--pr", required=True, type=int)
     post.add_argument("--head-sha", required=True)
     post.add_argument("--base-sha", required=True, help="the base the review diffed against")
-    post.add_argument("--lane", required=True)
-    post.add_argument("--model", required=True, help="the reviewing model")
-    post.add_argument("--verify-model", help="the model that confirmed the findings")
-    post.add_argument("--in", dest="input", default="verified.jsonl")
-    post.add_argument("--status", default="review-status.json")
+    post.add_argument("--dir", required=True, help="what review-lanes wrote: a directory per lane")
     post.add_argument("--dry-run", action="store_true", help="print the review instead of posting it")
-    post.add_argument("--result", help="write the lane's result here, for `summary`")
+    post.add_argument("--results", help="write each lane's result here, for `summary`")
     post.set_defaults(func=cmd_post)
 
-    summ = sub.add_parser("summary", help="post one comment summarising every lane of the run")
+    summ = sub.add_parser("summary", help="post one comment summarising every lane of the run (lanes in $GOOSE_REVIEW_LANES, if set)")
     summ.add_argument("--repo", required=True, help="owner/name")
     summ.add_argument("--pr", required=True, type=int)
     summ.add_argument("--head-sha", required=True)

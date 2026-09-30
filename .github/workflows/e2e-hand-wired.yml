@@ -16,7 +16,7 @@ concurrency:
 permissions: {}
 
 jobs:
-  tidy:
+  plan:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository
       && github.head_ref == 'e2e/hand-wired'
@@ -26,6 +26,8 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+    outputs:
+      lanes: ${{ steps.lanes.outputs.lanes }}
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -37,57 +39,100 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           sparse-checkout: |
+            lanes
             tidy
-            review
-            post
-            summary
             goose_review.py
-            setup-providers.sh
-            render-provider.sh
-            options.sh
+            tests/e2e/checks
+            tests/e2e/providers
           persist-credentials: false
+      - id: lanes
+        uses: ./lanes
+        with:
+          lanes: |
+            - lane: alpha
+              provider: routed
+              model: fake-a
+              verify-provider: direct
+              verify-model: fake-verifier
+            - lane: beta
+              provider: direct
+              model: fake-b
+              verify-provider: direct
+              verify-model: fake-empty
+              verify-backup-provider: direct
+              verify-backup-model: fake-backup
+          checks-dir: tests/e2e/checks
+          providers-dir: tests/e2e/providers
       - uses: ./tidy
 
-  lane:
-    name: ${{ matrix.lane }}
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository
-      && github.head_ref == 'e2e/hand-wired'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - lane: alpha
-            provider: routed
-            model: fake-a
-            verify-provider: direct
-            verify-model: fake-verifier
-          - lane: beta
-            provider: direct
-            model: fake-b
-            verify-provider: direct
-            verify-model: fake-empty
-            verify-backup-provider: direct
-            verify-backup-model: fake-backup
-    # The most the lane's jobs use: review reads, post writes the review.
+  review:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
     permissions:
       contents: read
-      pull-requests: write
-    uses: ./.github/workflows/e2e-hand-wired-lane.yml
-    with:
-      lane: ${{ matrix.lane }}
-      provider: ${{ matrix.provider }}
-      model: ${{ matrix.model }}
-      verify-provider: ${{ matrix['verify-provider'] }}
-      verify-model: ${{ matrix['verify-model'] }}
-      verify-backup-provider: ${{ matrix['verify-backup-provider'] || '' }}
-      verify-backup-model: ${{ matrix['verify-backup-model'] || '' }}
+      pull-requests: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            productionresultssa0.blob.core.windows.net:443
+            productionresultssa1.blob.core.windows.net:443
+            productionresultssa2.blob.core.windows.net:443
+            productionresultssa3.blob.core.windows.net:443
+            productionresultssa4.blob.core.windows.net:443
+            productionresultssa5.blob.core.windows.net:443
+            productionresultssa6.blob.core.windows.net:443
+            productionresultssa7.blob.core.windows.net:443
+            productionresultssa8.blob.core.windows.net:443
+            productionresultssa9.blob.core.windows.net:443
+            productionresultssa10.blob.core.windows.net:443
+            productionresultssa11.blob.core.windows.net:443
+            productionresultssa12.blob.core.windows.net:443
+            productionresultssa13.blob.core.windows.net:443
+            productionresultssa14.blob.core.windows.net:443
+            productionresultssa15.blob.core.windows.net:443
+            productionresultssa16.blob.core.windows.net:443
+            productionresultssa17.blob.core.windows.net:443
+            productionresultssa18.blob.core.windows.net:443
+            productionresultssa19.blob.core.windows.net:443
 
-  summary:
-    needs: [tidy, lane]
-    if: ${{ !cancelled() && needs.lane.result != 'skipped' }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the fakes
+        env:
+          E2E_EGRESS_PROBE: "false"
+        run: bash tests/e2e/setup.sh
+
+      - uses: ./review
+        with:
+          lanes: ${{ needs.plan.outputs.lanes }}
+          checks-dir: tests/e2e/checks
+          facts-dir: tests/e2e/facts
+          providers-dir: tests/e2e/providers
+          install-goose: "false"
+          provider-routes: routed=http://127.0.0.1:8765/r1
+          provider-env: |
+            E2E_ROUTED_KEY=e2e-routed-key-0000
+            E2E_DIRECT_KEY=e2e-direct-key-0000
+
+  post:
+    needs: [plan, review]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -125,20 +170,20 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           sparse-checkout: |
-            tidy
-            review
             post
-            summary
             goose_review.py
-            setup-providers.sh
-            render-provider.sh
-            options.sh
           persist-credentials: false
-      - uses: ./summary
+      - uses: ./post
+        with:
+          lanes: ${{ needs.plan.outputs.lanes }}
+          provider-routes: routed=http://127.0.0.1:8765/r1
+          provider-env: |
+            E2E_ROUTED_KEY=e2e-routed-key-0000
+            E2E_DIRECT_KEY=e2e-direct-key-0000
 
   assert:
-    needs: summary
-    if: ${{ !cancelled() && needs.summary.result != 'skipped' }}
+    needs: post
+    if: ${{ !cancelled() && needs.post.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

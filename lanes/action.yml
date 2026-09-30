@@ -2,7 +2,7 @@ name: Goose review - lanes
 description: >-
   Reads the caller's lanes -- YAML (a list of mappings) or JSON -- checks
   them against the checks and provider templates in the checkout, and
-  outputs them as JSON for a lane matrix. A mistyped key, a missing model,
+  outputs them as JSON for the review and post actions. A mistyped key, a missing model,
   an unknown check or provider is an error here, before any lane runs.
   So is a malformed tool, when the caller's tools are given.
 author: Stephan Meijer

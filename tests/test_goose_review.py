@@ -1,9 +1,14 @@
 """Markers in what the Goose review posts: written by `comment_body`,
 read back by `posted_finding`. Run: python3 -m unittest discover -s tests"""
 
+import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -192,6 +197,93 @@ class Small(unittest.TestCase):
              "did_not_run": False, "post_error": None, "headline": "h", "model": "m", "verify_model": "v"}
         self.assertEqual(g.lane_row("l", r, {})["posted"],
                          "0 <sub>(3 rejected, of which 1 already answered and 1 without evidence; 2 downgraded)</sub>")
+
+
+def outcome(lane: str, *findings: dict) -> g.LaneOutcome:
+    meta = {"lane": lane, "commit": "c0ffee", "model": f"{lane}-model", "verify_model": "v"}
+    return g.LaneOutcome(lane={"lane": lane}, findings=list(findings), status={}, missing=False, found=None, meta=meta)
+
+
+def at(path: str, start: int, end: int, severity: str = "medium", **more: object) -> dict:
+    return {"path": path, "line_start": start, "line_end": end, "severity": severity, "check": "c", "summary": "s", **more}
+
+
+class Placing(unittest.TestCase):
+    """Every lane's findings in one review: one thread per place in the
+    code, whichever lanes found it."""
+
+    LINES = {"a.py": {n: 0 for n in range(1, 21)}}
+
+    def test_lanes_on_the_same_lines_share_a_thread(self) -> None:
+        placed = g.place_findings(
+            [outcome("x", at("a.py", 3, 5)), outcome("y", at("a.py", 5, 6, "high"), at("a.py", 15, 15))], self.LINES, [])
+        self.assertEqual([[m["lane"] for _, m in t["members"]] for t in placed.threads], [["y", "x"], ["y"]])
+        lead = g.posted_finding(placed.threads[0]["comment"]["body"])
+        self.assertEqual((lead["model"], lead["severity"]), ("y-model", "high"))
+        replies = g.thread_replies(placed.threads[0]["members"])
+        self.assertEqual([g.posted_finding(r)["model"] for r in replies], ["x-model"])
+
+    def test_outside_the_diff_and_open_threads(self) -> None:
+        open_thread = {"path": "a.py", "line": 8, "startLine": 7, "all": [{"databaseId": 1}], "id": "T"}
+        placed = g.place_findings([outcome("x", at("a.py", 30, 31), at("a.py", 8, 8, also=[{"check": "d", "severity": "low", "summary": "n"}]))],
+                                  self.LINES, [open_thread])
+        self.assertEqual([f["line_start"] for f, _ in placed.loose], [30])
+        self.assertEqual([(f["line_start"], t["id"]) for f, _, t in placed.into_open], [(8, "T")])
+        self.assertEqual(placed.threads, [])
+
+    def test_a_findings_other_checks_reply_in_its_thread(self) -> None:
+        placed = g.place_findings([outcome("x", at("a.py", 2, 2, also=[{"check": "d", "severity": "low", "summary": "n"}]))],
+                                  self.LINES, [])
+        replies = g.thread_replies(placed.threads[0]["members"])
+        self.assertEqual([g.posted_finding(r)["check"] for r in replies], ["d"])
+
+    def test_the_body_groups_findings_by_lane_each_signed(self) -> None:
+        x, y = outcome("x"), outcome("y")
+        lines = g.body_blocks([(at("a.py", 1, 1), y.meta, "a.py:1"), (at("b.py", 2, 2), x.meta, "b.py:2")], [x, y])
+        text = "\n".join(lines)
+        self.assertLess(text.index("b.py:2"), text.index("**x-model**"))
+        self.assertLess(text.index("**x-model**"), text.index("a.py:1"))
+        self.assertLess(text.index("a.py:1"), text.index("**y-model**"))
+
+
+class Posting(unittest.TestCase):
+    """`post` with the GitHub API stubbed: one review for every lane."""
+
+    def test_one_review_for_every_lane(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        lanes = [{"lane": n, "provider": "p", "model": f"{n}-model", "verify-provider": "p", "verify-model": "v"}
+                 for n in ("a", "b", "c")]
+        for name, line in (("a", 3), ("b", 4)):
+            (root / "review" / name).mkdir(parents=True)
+            finding = {**at("x.py", line, line), "check": name}
+            (root / "review" / name / "verified.jsonl").write_text(json.dumps(finding) + "\n")
+            (root / "review" / name / "findings.jsonl").write_text(json.dumps(finding) + "\n")
+        calls = []
+
+        def github(method, url, token, body=None, accept=None):  # noqa: ANN001
+            calls.append((method, url, body))
+            return (200, {"id": 9, "html_url": "https://review"}) if url.endswith("/reviews") else (201, {})
+
+        args = SimpleNamespace(repo="o/r", pr=1, head_sha="h", base_sha="b", dir=str(root / "review"),
+                               results=str(root / "results"), dry_run=False)
+        env = {"GH_TOKEN": "t", g.LANES_ENV: json.dumps(lanes)}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(g, "compare_files", return_value=[{"filename": "x.py", "patch": "@@ -1,0 +1,5 @@\n" + "+\n" * 5}]), \
+                mock.patch.object(g, "open_threads", return_value=[]), \
+                mock.patch.object(g, "collapse_resolved", return_value=0), \
+                mock.patch.object(g, "paged", return_value=[{"path": "x.py", "line": 3, "id": 5}]), \
+                mock.patch.object(g, "github", github):
+            g.cmd_post(args)
+        reviews = [body for method, url, body in calls if url.endswith("/reviews")]
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual([c["line"] for c in reviews[0]["comments"]], [3])
+        self.assertEqual([m["name"] for m in g.markers(reviews[0]["body"], "lane")], ["a", "b", "c"])
+        replies = [body for method, url, body in calls if url.endswith("/comments/5/replies")]
+        self.assertEqual([g.posted_finding(r["body"])["model"] for r in replies], ["b-model"])
+        results = {n: json.loads((root / "results" / f"{n}.json").read_text()) for n in ("a", "b", "c")}
+        self.assertEqual([results[n]["review_url"] for n in "abc"], ["https://review", "https://review", None])
+        self.assertTrue(results["c"]["did_not_run"])
+        self.assertEqual(results["b"]["found"], 1)
 
 
 class Described(unittest.TestCase):

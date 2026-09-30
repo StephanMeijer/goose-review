@@ -1,8 +1,9 @@
 # The pre-composed review.yml end to end, on every pull request of this
 # repository, with tests/fake-goose for the models and a local server for
 # the providers' preflight. Two lanes: `alpha` through a routed provider,
-# `beta` through a direct one, slower (it posts into alpha's open thread)
-# and verified by its backup (its verifier answers empty). `assert` then
+# `beta` through a direct one and verified by its backup (its verifier
+# answers empty); both find the planted line, so beta's finding is a reply
+# in alpha's thread. `assert` then
 # reads the pull request back. The branch e2e/fixture adds the planted
 # line; on other pull requests (while this repository does not review
 # itself, see goose-review.yml) the check has nothing to review, and only
@@ -45,7 +46,7 @@ jobs:
 
         - lane: beta
           provider: direct
-          model: fake-b              # slow: posts into alpha's open thread
+          model: fake-b
           verify-provider: direct
           verify-model: fake-empty   # answers empty: its backup verifies
           verify-backup-provider: direct

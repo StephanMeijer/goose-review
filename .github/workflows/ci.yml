@@ -41,7 +41,7 @@ jobs:
           tar xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
 
-      # review.yml and lane.yml pin this repository's actions; every pin
+      # review.yml pins this repository's actions; every pin
       # must carry exactly HEAD's action code.
       - name: Check the pins
         run: scripts/check-pins.sh

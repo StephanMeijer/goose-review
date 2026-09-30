@@ -1,12 +1,15 @@
 """The engine end to end with tests/fake-goose, no network: review finds the
 planted line, verify keeps it with evidence, and a verifier that answers
-empty hands over to the backup. Run: python3 -m unittest discover -s tests"""
+empty hands over to the backup; review-lanes does both for every lane at
+once. Run: python3 -m unittest discover -s tests"""
 
+import http.server
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -14,7 +17,9 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGINE = ROOT / "goose_review.py"
 
 
-class Engine(unittest.TestCase):
+class Repo(unittest.TestCase):
+    """A repository whose last commit adds a planted line, with the fake on PATH."""
+
     def setUp(self) -> None:
         self.repo = Path(tempfile.mkdtemp())
         bin_dir = self.repo / ".fakebin"
@@ -55,6 +60,8 @@ class Engine(unittest.TestCase):
     def status(self) -> dict:
         return json.loads((self.repo / "out" / "status.json").read_text())
 
+
+class Engine(Repo):
     def review(self) -> None:
         self.engine("review", "--base", "HEAD~1", "--provider", "p", "--model", "reviewer",
                     "--ignore", "gen/**", "--out", "out/findings.jsonl", "--status", "out/status.json")
@@ -87,6 +94,63 @@ class Engine(unittest.TestCase):
                     "--out", "out/findings.jsonl", "--status", "out/status.json")
         self.assertEqual(self.read("findings.jsonl"), [])
         self.assertEqual(self.status()["checks_run"], [])
+
+
+class Lanes(Repo):
+    """review-lanes: every lane in one call, each in its own directory; a
+    lane whose provider does not answer stops alone."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Models)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        providers = self.repo / ".config" / "goose" / "custom_providers"
+        providers.mkdir(parents=True)
+        (providers / "p.json").write_text(json.dumps({
+            "name": "p", "base_url": f"http://127.0.0.1:{server.server_address[1]}",
+            "base_path": "chat/completions", "requires_auth": False,
+        }))
+        self.env["XDG_CONFIG_HOME"] = str(self.repo / ".config")
+
+    def lanes(self, lanes: list[dict]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(ENGINE), "review-lanes", "--base", "HEAD~1", "--out", "out", "--", "--ignore", "gen/**"],
+            cwd=self.repo, env={**self.env, "GOOSE_REVIEW_LANES": json.dumps(lanes),
+                                "GOOSE_REVIEW_LOG_DIR": str(self.repo / "logs")},
+            capture_output=True, text=True,
+        )
+
+    def lane(self, name: str, **more: object) -> dict:
+        return {"lane": name, "provider": "p", "model": f"{name}-reviewer", "verify-provider": "p",
+                "verify-model": f"{name}-verifier", **more}
+
+    def test_every_lane_reviews_and_verifies(self) -> None:
+        done = self.lanes([self.lane("a"), self.lane("b", checks=["other"])])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(len(self.read("a/verified.jsonl")), 1)
+        self.assertEqual(self.read("b/verified.jsonl"), [])
+        self.assertEqual(json.loads((self.repo / "out/b/status.json").read_text())["checks_run"], [])
+        self.assertIn("[a] ", done.stdout)
+        self.assertTrue(any((self.repo / "logs" / "a").iterdir()))
+
+    def test_a_lane_whose_provider_is_missing_fails_alone(self) -> None:
+        done = self.lanes([self.lane("a"), self.lane("b", provider="nowhere")])
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(len(self.read("a/verified.jsonl")), 1)
+        self.assertIn("nowhere provider is not configured", json.loads((self.repo / "out/b/status.json").read_text())["error"])
+        self.assertIn("::warning::b: preflight failed", done.stdout)
+
+
+class Models(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"data": []}')
+
+    def log_message(self, *args: object) -> None:
+        pass
 
 
 if __name__ == "__main__":

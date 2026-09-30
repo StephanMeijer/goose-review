@@ -1,8 +1,7 @@
 # The Goose review wired by hand from the composite actions, for a job
 # layout of your own. examples/caller.yml does the same through the
-# pre-composed workflow in fewer lines. Keep the lane jobs named `review`
-# and `post` (in goose-review-lane.yml): the summary links each lane's row
-# to them by name.
+# pre-composed workflow in fewer lines. Keep the jobs named `review` and
+# `post`: the summary links every lane's row to them by name.
 name: Goose review
 
 on:
@@ -16,7 +15,9 @@ concurrency:
 permissions: {}
 
 jobs:
-  tidy:
+  # Check the lanes before anything runs, then collapse the review's
+  # resolved threads and mark the run as running. No model runs here.
+  plan:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository
       && !github.event.pull_request.draft
@@ -26,6 +27,8 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+    outputs:
+      lanes: ${{ steps.lanes.outputs.lanes }}
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -33,49 +36,95 @@ jobs:
           allowed-endpoints: >
             github.com:443
             api.github.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: |
+            .agents/checks
+            .github/goose/providers
+          persist-credentials: false
+      - id: lanes
+        uses: StephanMeijer/goose-review/lanes@583a38a2ee99a7f01f76f39a81b9cd84076fadee # v0.3.2
+        with:
+          lanes: |
+            - lane: deepseek
+              provider: my_proxy
+              model: deepseek-v4-flash
+              verify-provider: my_proxy
+              verify-model: MiniMax-M3
+              verify-backup-provider: my_proxy
+              verify-backup-model: deepseek-v4-flash
+            - lane: minimax
+              provider: my_proxy
+              model: MiniMax-M3
+              verify-provider: my_proxy
+              verify-model: deepseek-v4-flash
       - uses: StephanMeijer/goose-review/tidy@583a38a2ee99a7f01f76f39a81b9cd84076fadee # v0.3.2
 
-  lane:
-    name: ${{ matrix.lane }}
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository
-      && !github.event.pull_request.draft
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - lane: deepseek
-            provider: my_proxy
-            model: deepseek-v4-flash
-            verify-provider: my_proxy
-            verify-model: MiniMax-M3
-            verify-backup-provider: my_proxy
-            verify-backup-model: deepseek-v4-flash
-          - lane: minimax
-            provider: my_proxy
-            model: MiniMax-M3
-            verify-provider: my_proxy
-            verify-model: deepseek-v4-flash
-    # The most the lane's jobs use: review reads, post writes the review.
+  # Every lane at once. The models have a shell here: read-only token,
+  # network blocked but for GitHub and your providers, no sudo.
+  review:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
     permissions:
       contents: read
-      pull-requests: write
-    uses: ./.github/workflows/goose-review-lane.yml
-    with:
-      lane: ${{ matrix.lane }}
-      provider: ${{ matrix.provider }}
-      model: ${{ matrix.model }}
-      verify-provider: ${{ matrix['verify-provider'] }}
-      verify-model: ${{ matrix['verify-model'] }}
-      verify-backup-provider: ${{ matrix['verify-backup-provider'] || '' }}
-      verify-backup-model: ${{ matrix['verify-backup-model'] || '' }}
-    secrets: inherit
+      pull-requests: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            productionresultssa0.blob.core.windows.net:443
+            productionresultssa1.blob.core.windows.net:443
+            productionresultssa2.blob.core.windows.net:443
+            productionresultssa3.blob.core.windows.net:443
+            productionresultssa4.blob.core.windows.net:443
+            productionresultssa5.blob.core.windows.net:443
+            productionresultssa6.blob.core.windows.net:443
+            productionresultssa7.blob.core.windows.net:443
+            productionresultssa8.blob.core.windows.net:443
+            productionresultssa9.blob.core.windows.net:443
+            productionresultssa10.blob.core.windows.net:443
+            productionresultssa11.blob.core.windows.net:443
+            productionresultssa12.blob.core.windows.net:443
+            productionresultssa13.blob.core.windows.net:443
+            productionresultssa14.blob.core.windows.net:443
+            productionresultssa15.blob.core.windows.net:443
+            productionresultssa16.blob.core.windows.net:443
+            productionresultssa17.blob.core.windows.net:443
+            productionresultssa18.blob.core.windows.net:443
+            productionresultssa19.blob.core.windows.net:443
+            llm-proxy.example.com:443
 
-  summary:
-    needs: [tidy, lane]
-    if: ${{ !cancelled() && needs.lane.result != 'skipped' }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Your own preparation here, before any secret or model runs.
+
+      - uses: StephanMeijer/goose-review/review@583a38a2ee99a7f01f76f39a81b9cd84076fadee # v0.3.2
+        with:
+          lanes: ${{ needs.plan.outputs.lanes }}
+          provider-routes: ${{ secrets.GOOSE_REVIEW_ROUTES }}
+          provider-env: ${{ secrets.GOOSE_REVIEW_PROVIDER_ENV }}
+
+  # No model; alone may write to the pull request, and scrubs again before
+  # it does. One review for every lane, then the summary comment.
+  post:
+    needs: [plan, review]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -109,4 +158,8 @@ jobs:
             productionresultssa17.blob.core.windows.net:443
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
-      - uses: StephanMeijer/goose-review/summary@583a38a2ee99a7f01f76f39a81b9cd84076fadee # v0.3.2
+      - uses: StephanMeijer/goose-review/post@583a38a2ee99a7f01f76f39a81b9cd84076fadee # v0.3.2
+        with:
+          lanes: ${{ needs.plan.outputs.lanes }}
+          provider-routes: ${{ secrets.GOOSE_REVIEW_ROUTES }}
+          provider-env: ${{ secrets.GOOSE_REVIEW_PROVIDER_ENV }}

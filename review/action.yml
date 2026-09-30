@@ -1,38 +1,22 @@
 name: Goose review - review
 description: >-
-  One lane's review: the caller's checks run with one model, a model of
-  another family verifies every finding, and the result is scrubbed and
-  uploaded for the `post` action. Runs in a job with a read-only token and
-  its network blocked but for what it needs (the caller's harden-runner step
-  comes first). The model gets a shell in the checkout; nothing later in
-  this job is trusted, which is why `post` runs in another job.
+  Every lane's review, at once: in each lane the caller's checks run with
+  its model, a model of another family verifies every finding, and the
+  results are scrubbed and uploaded, one directory per lane, for the
+  `post` action. Runs in a job with a read-only token and its network
+  blocked but for what it needs (the caller's harden-runner step comes
+  first). The models get a shell in the checkout; nothing later in this
+  job is trusted, which is why `post` runs in another job.
 author: Stephan Meijer
 
 inputs:
-  lane:
-    description: The lane's name, [a-z0-9-]+. Names its artifact and its review on the pull request.
+  lanes:
+    description: >-
+      Every lane, as YAML (a list of mappings) or JSON: lane, provider,
+      model, verify-provider, verify-model, and optionally
+      verify-backup-provider and verify-backup-model, checks and jobs. See
+      the README. All lanes run at once, each with its own models.
     required: true
-  provider:
-    description: The reviewing model's Goose provider (a template in providers-dir).
-    required: true
-  model:
-    description: The reviewing model.
-    required: true
-  verify-provider:
-    description: The verifying model's provider. Use another model family than the reviewer's.
-    required: true
-  verify-model:
-    description: The verifying model.
-    required: true
-  verify-backup-provider:
-    description: Verifies instead when verify-provider answers empty or gives no verdicts. Optional.
-    default: ""
-  verify-backup-model:
-    description: The backup verifier's model.
-    default: ""
-  checks:
-    description: Only these checks, by name, one per line. Empty runs every check in checks-dir.
-    default: ""
   checks-dir:
     description: Directory of the check files.
     default: .agents/checks
@@ -56,14 +40,11 @@ inputs:
       The caller's tools, as given to the tools action (which installs
       them): announced to the model, each with its `use`. Optional.
     default: ""
-  jobs:
-    description: Checks run at once.
-    default: "2"
   budget-minutes:
-    description: Wall-clock budget for all checks.
+    description: Each lane's wall-clock budget for its checks.
     default: "35"
   verify-budget-minutes:
-    description: Wall-clock budget for verification.
+    description: Each lane's wall-clock budget for verification.
     default: "12"
   provider-routes:
     description: >-
@@ -98,14 +79,9 @@ runs:
     - name: Prepare
       shell: bash
       env:
-        LANE: ${{ inputs.lane }}
         GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
       run: |
-        if ! [[ $LANE =~ ^[a-z0-9-]+$ ]] || [ "$LANE" = summary ]; then
-          echo "::error::lane must be [a-z0-9-]+ and not 'summary'" >&2
-          exit 1
-        fi
         python3 "$GITHUB_ACTION_PATH/../goose_review.py" mask
         mkdir -p "$RUNNER_TEMP/review" "$RUNNER_TEMP/bin"
         echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
@@ -172,18 +148,6 @@ runs:
           exit 1
         fi
 
-    - name: Preflight the providers
-      shell: bash
-      env:
-        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
-        PROVIDER: ${{ inputs.provider }}
-        VERIFY_PROVIDER: ${{ inputs.verify-provider }}
-        BACKUP_PROVIDER: ${{ inputs.verify-backup-provider }}
-      run: >
-        python3 "$GITHUB_ACTION_PATH/../goose_review.py" preflight
-        --provider "$PROVIDER" --provider "$VERIFY_PROVIDER" --provider "$BACKUP_PROVIDER"
-        --status "$RUNNER_TEMP/review/status.json"
-
     # Title and body go through the environment into a file: PR text is
     # never interpolated into a script, and the prompts mark it as data.
     - name: Collect the pull request description
@@ -207,16 +171,17 @@ runs:
         --repo "$REPO" --pr "$PR" --out "$RUNNER_TEMP/answered.json"
         || echo "::warning::could not collect the answered findings; verifying without them"
 
-    - name: Review (${{ inputs.model }})
+    # Each lane checks its providers, reviews and verifies, all lanes at
+    # once, into $RUNNER_TEMP/review/<lane>/. A lane that fails stops
+    # alone; `post` reports it.
+    - name: Review and verify, every lane
       shell: bash
       env:
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+        GOOSE_REVIEW_LANES: ${{ inputs.lanes }}
         BASE: ${{ github.event.pull_request.base.sha }}
-        PROVIDER: ${{ inputs.provider }}
-        MODEL: ${{ inputs.model }}
-        JOBS: ${{ inputs.jobs }}
         BUDGET: ${{ inputs.budget-minutes }}
-        CHECKS: ${{ inputs.checks }}
+        VERIFY_BUDGET: ${{ inputs.verify-budget-minutes }}
         CHECKS_DIR: ${{ inputs.checks-dir }}
         FACTS_DIR: ${{ inputs.facts-dir }}
         IGNORE: ${{ inputs.ignore }}
@@ -225,38 +190,10 @@ runs:
         RULES_FILE: ${{ inputs.rules-file }}
       run: |
         source "$GITHUB_ACTION_PATH/../options.sh"
-        python3 "$GITHUB_ACTION_PATH/../goose_review.py" review \
-          --base "$BASE" --provider "$PROVIDER" --model "$MODEL" \
-          --jobs "$JOBS" --budget-minutes "$BUDGET" --context "$RUNNER_TEMP/pr.md" \
-          "${options[@]}" "${checks[@]}" \
-          --out "$RUNNER_TEMP/review/findings.jsonl" --status "$RUNNER_TEMP/review/status.json"
-
-    - name: Verify (${{ inputs.verify-model }})
-      shell: bash
-      env:
-        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
-        BASE: ${{ github.event.pull_request.base.sha }}
-        PROVIDER: ${{ inputs.verify-provider }}
-        MODEL: ${{ inputs.verify-model }}
-        BACKUP_PROVIDER: ${{ inputs.verify-backup-provider }}
-        BACKUP_MODEL: ${{ inputs.verify-backup-model }}
-        BUDGET: ${{ inputs.verify-budget-minutes }}
-        CHECKS: ""
-        CHECKS_DIR: ${{ inputs.checks-dir }}
-        FACTS_DIR: ${{ inputs.facts-dir }}
-        IGNORE: ${{ inputs.ignore }}
-        TOOLS_FILE: ${{ inputs.tools-file }}
-        TOOLS: ${{ inputs.tools }}
-        RULES_FILE: ${{ inputs.rules-file }}
-      run: |
-        source "$GITHUB_ACTION_PATH/../options.sh"
-        python3 "$GITHUB_ACTION_PATH/../goose_review.py" verify \
-          --base "$BASE" --provider "$PROVIDER" --model "$MODEL" \
-          --backup-provider "$BACKUP_PROVIDER" --backup-model "$BACKUP_MODEL" \
-          --budget-minutes "$BUDGET" --context "$RUNNER_TEMP/pr.md" --answered "$RUNNER_TEMP/answered.json" \
-          "${options[@]}" \
-          --in "$RUNNER_TEMP/review/findings.jsonl" --out "$RUNNER_TEMP/review/verified.jsonl" \
-          --status "$RUNNER_TEMP/review/status.json"
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" review-lanes \
+          --base "$BASE" --context "$RUNNER_TEMP/pr.md" --answered "$RUNNER_TEMP/answered.json" \
+          --budget-minutes "$BUDGET" --verify-budget-minutes "$VERIFY_BUDGET" \
+          --out "$RUNNER_TEMP/review" -- "${options[@]}"
 
     # The model could write to these directories through its shell, so
     # everything uploaded is scrubbed first, not only what the script wrote.
@@ -273,11 +210,10 @@ runs:
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: goose-review-${{ inputs.lane }}
+        name: goose-review
         path: |
-          ${{ runner.temp }}/review/findings.jsonl
-          ${{ runner.temp }}/review/verified.jsonl
-          ${{ runner.temp }}/review/status.json
-          ${{ runner.temp }}/goose-logs/*.log
+          ${{ runner.temp }}/review/**/*.jsonl
+          ${{ runner.temp }}/review/**/status.json
+          ${{ runner.temp }}/goose-logs/**/*.log
         if-no-files-found: ignore
         retention-days: 14
