@@ -4,7 +4,8 @@
 # GOOSE_REVIEW_ENABLED is `true`:
 #
 #   secrets    GOOSE_PROXY_TOKEN, GOOSE_THIRDPARTY_BASE_URL, GOOSE_MINIMAX_BASE_URL
-#   variables  GOOSE_PROXY_EGRESS (the proxy's host:port), GOOSE_REVIEW_ENABLED
+#   variables  GOOSE_PROXY_EGRESS (the proxy's host:port), GOOSE_REVIEW_ENABLED,
+#              GOOSE_FREE_BASE_URL (the free pool's route, not a secret)
 #
 # The fixture branches (e2e/*) are the end-to-end tests' own: one review run
 # per pull request, as they share its summary comment.
@@ -43,6 +44,9 @@ jobs:
           "verify-backup-provider": "minimax", "verify-backup-model": "MiniMax-M3", "jobs": 3},
          {"lane": "mistral", "provider": "thirdparty", "model": "mistral-medium-3-5",
           "verify-provider": "minimax", "verify-model": "MiniMax-M3",
+          "verify-backup-provider": "thirdparty", "verify-backup-model": "deepseek-v4-flash-0731"},
+         {"lane": "free", "provider": "free", "model": "free",
+          "verify-provider": "minimax", "verify-model": "MiniMax-M3",
           "verify-backup-provider": "thirdparty", "verify-backup-model": "deepseek-v4-flash-0731"}]
       egress-endpoints: ${{ vars.GOOSE_PROXY_EGRESS }}
       ignore: |
@@ -52,5 +56,6 @@ jobs:
       PROVIDER_ROUTES: |
         thirdparty=${{ secrets.GOOSE_THIRDPARTY_BASE_URL }}
         minimax=${{ secrets.GOOSE_MINIMAX_BASE_URL }}
+        free=${{ vars.GOOSE_FREE_BASE_URL }}
       PROVIDER_ENV: |
         GOOSE_PROXY_TOKEN=${{ secrets.GOOSE_PROXY_TOKEN }}
