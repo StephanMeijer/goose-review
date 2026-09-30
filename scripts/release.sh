@@ -2,7 +2,7 @@
 # Release v<version> from main.
 #
 # 1. Checks: a clean main, level with origin; the tests; the pins
-#    (review.yml and lane.yml must carry HEAD's action code).
+#    (review.yml must carry HEAD's action code).
 # 2. Tags HEAD v<version> and moves the major tag (v0 for 0.x.y) to it.
 # 3. Points the examples and the README at the release commit, in a commit
 #    of its own (a commit cannot name itself), and pushes main and the tags.

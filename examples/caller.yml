@@ -30,25 +30,25 @@ jobs:
       issues: write
       pull-requests: write
     with:
-      # One lane per reviewing model; each finding is verified by a model of
-      # another family, and by the backup when that one's provider is down.
-      # Checked before any lane runs: a mistyped key, an unknown check or a
+      # One lane per reviewing model, each in a job of its own. Checked
+      # before any lane runs: a mistyped key, an unknown check or a
       # provider without a template stops the run with the error shown.
       lanes: |
         - lane: deepseek
           provider: my_proxy
           model: deepseek-v4-flash
-          verify-provider: my_proxy
-          verify-model: MiniMax-M3
-          verify-backup-provider: my_proxy
-          verify-backup-model: deepseek-v4-flash
 
         - lane: minimax
           provider: my_proxy
           model: MiniMax-M3
-          verify-provider: my_proxy
-          verify-model: deepseek-v4-flash
           checks: [security, correctness]
+      # One model verifies every lane's findings, in one job, and the
+      # backup when that one's provider is down. Findings of the verifier's
+      # own family (here the minimax lane's) are verified by it too.
+      verify-provider: my_proxy
+      verify-model: MiniMax-M3
+      verify-backup-provider: my_proxy
+      verify-backup-model: deepseek-v4-flash
       # The hosts your providers (or your egress proxy) are on, and what
       # `setup` downloads from; the review job can reach nothing else. A JSON
       # list: harden-runner splits its allow-list on single spaces.
