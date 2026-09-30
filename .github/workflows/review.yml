@@ -144,13 +144,13 @@ jobs:
             ${{ inputs.providers-dir }}
           persist-credentials: false
       - id: lanes
-        uses: StephanMeijer/goose-review/lanes@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+        uses: StephanMeijer/goose-review/lanes@56076072389fed14eb0cbcb288c0b8038c330ace
         with:
           lanes: ${{ inputs.lanes }}
           checks-dir: ${{ inputs.checks-dir }}
           providers-dir: ${{ inputs.providers-dir }}
           tools: ${{ inputs.tools }}
-      - uses: StephanMeijer/goose-review/tidy@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/tidy@56076072389fed14eb0cbcb288c0b8038c330ace
 
   # Every lane at once, in one job: the models have a shell here, with a
   # read-only token and the network blocked but for GitHub, the providers
@@ -222,7 +222,7 @@ jobs:
       # The caller's tools, pinned by sha256, before its setup (which may
       # use them) and before any secret or model.
       - if: inputs.tools != ''
-        uses: StephanMeijer/goose-review/tools@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+        uses: StephanMeijer/goose-review/tools@56076072389fed14eb0cbcb288c0b8038c330ace
         with:
           tools: ${{ inputs.tools }}
 
@@ -234,7 +234,7 @@ jobs:
           SETUP: ${{ inputs.setup }}
         run: bash -euo pipefail -c "$SETUP"
 
-      - uses: StephanMeijer/goose-review/review@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/review@56076072389fed14eb0cbcb288c0b8038c330ace
         with:
           lanes: ${{ needs.plan.outputs.lanes }}
           checks-dir: ${{ inputs.checks-dir }}
@@ -293,7 +293,7 @@ jobs:
             productionresultssa17.blob.core.windows.net:443
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
-      - uses: StephanMeijer/goose-review/post@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/post@56076072389fed14eb0cbcb288c0b8038c330ace
         with:
           lanes: ${{ needs.plan.outputs.lanes }}
           provider-routes: ${{ secrets.PROVIDER_ROUTES }}
