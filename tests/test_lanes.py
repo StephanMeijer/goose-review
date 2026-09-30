@@ -20,35 +20,23 @@ YAML = """
 - lane: deepseek
   provider: notedthat_thirdparty
   model: deepseek-v4-flash-0731   # the third-party endpoint
-  verify-provider: notedthat_minimax
-  verify-model: MiniMax-M3
-  verify-backup-provider: notedthat_thirdparty
-  verify-backup-model: "deepseek-v4-flash-0731"
   jobs: 2
 
 - lane: minimax
   provider: notedthat_minimax
   model: 'MiniMax-M3'
-  verify-provider: notedthat_thirdparty
-  verify-model: deepseek-v4-flash-0731
   checks: [security, correctness]
 -
   lane: mistral
-  provider: notedthat_thirdparty
+  provider: "notedthat_thirdparty"
   model: mistral-medium-3-5
-  verify-provider: notedthat_minimax
-  verify-model: MiniMax-M3
   checks:
   - security
   -   correctness
 """
 
-FIRST = {
-    "lane": "deepseek", "provider": "notedthat_thirdparty", "model": "deepseek-v4-flash-0731",
-    "verify-provider": "notedthat_minimax", "verify-model": "MiniMax-M3",
-    "verify-backup-provider": "notedthat_thirdparty", "verify-backup-model": "deepseek-v4-flash-0731",
-    "checks": [], "jobs": 2,
-}
+FIRST = {"lane": "deepseek", "provider": "notedthat_thirdparty", "model": "deepseek-v4-flash-0731", "checks": [], "jobs": 2}
+ONE = "  provider: p\n  model: m\n"
 
 
 def lanes(text: str, **known: list[str]) -> list[dict]:
@@ -61,7 +49,7 @@ class Parse(unittest.TestCase):
         self.assertEqual(got[0], FIRST)
         self.assertEqual(got[1]["checks"], ["security", "correctness"])
         self.assertEqual(got[1]["model"], "MiniMax-M3")
-        self.assertEqual(got[1]["verify-backup-provider"], "")
+        self.assertEqual(got[2]["provider"], "notedthat_thirdparty")
         self.assertEqual(got[2]["checks"], ["security", "correctness"])
         self.assertEqual([lane["lane"] for lane in got], ["deepseek", "minimax", "mistral"])
 
@@ -70,13 +58,13 @@ class Parse(unittest.TestCase):
         self.assertEqual(lanes(text), [FIRST])
 
     def test_checks_as_a_string(self) -> None:
-        text = "- lane: a\n  provider: p\n  model: m\n  verify-provider: p\n  verify-model: v\n  checks: security, correctness\n"
+        text = f"- lane: a\n{ONE}  checks: security, correctness\n"
         self.assertEqual(lanes(text)[0]["checks"], ["security", "correctness"])
 
     def test_a_hash_inside_quotes_is_no_comment(self) -> None:
-        text = "- lane: a\n  provider: p\n  model: 'm#1'\n  verify-provider: p\n  verify-model: v # verifier\n"
+        text = "- lane: a\n  provider: p # the proxy\n  model: 'm#1'\n"
         got = lanes(text)[0]
-        self.assertEqual((got["model"], got["verify-model"]), ("m#1", "v"))
+        self.assertEqual((got["model"], got["provider"]), ("m#1", "p"))
 
 
 class Errors(unittest.TestCase):
@@ -85,29 +73,25 @@ class Errors(unittest.TestCase):
             lanes(text, **known)
 
     def test_a_mistyped_key(self) -> None:
-        self.fails("- lane: a\n  provider: p\n  model: m\n  verify-provider: p\n  verify_model: v\n",
-                   r"lane 1 \(a\): unknown key\(s\) verify_model")
+        self.fails(f"- lane: a\n{ONE}  job: 2\n", r"lane 1 \(a\): unknown key\(s\) job")
+        # The verifier is the workflow's, no lane's.
+        self.fails(f"- lane: a\n{ONE}  verify-model: v\n", r"unknown key\(s\) verify-model")
 
     def test_a_missing_key(self) -> None:
-        self.fails("- lane: a\n  provider: p\n  model: m\n  verify-provider: p\n", "missing verify-model")
+        self.fails("- lane: a\n  provider: p\n", "missing model")
 
     def test_a_bad_or_repeated_name(self) -> None:
-        one = "  provider: p\n  model: m\n  verify-provider: p\n  verify-model: v\n"
-        self.fails(f"- lane: Deep Seek\n{one}", r"\[a-z0-9-\]\+")
-        self.fails(f"- lane: summary\n{one}", "not `summary`")
-        self.fails(f"- lane: a\n{one}- lane: a\n{one}", "used twice")
-
-    def test_half_a_backup(self) -> None:
-        self.fails("- lane: a\n  provider: p\n  model: m\n  verify-provider: p\n  verify-model: v\n"
-                   "  verify-backup-model: b\n", "both verify-backup-provider and verify-backup-model")
+        self.fails(f"- lane: Deep Seek\n{ONE}", r"\[a-z0-9-\]\+")
+        self.fails(f"- lane: summary\n{ONE}", "not `summary`")
+        self.fails(f"- lane: a\n{ONE}- lane: a\n{ONE}", "used twice")
 
     def test_jobs_out_of_range(self) -> None:
-        self.fails("- lane: a\n  provider: p\n  model: m\n  verify-provider: p\n  verify-model: v\n  jobs: 0\n", "jobs must be")
+        self.fails(f"- lane: a\n{ONE}  jobs: 0\n", "jobs must be")
 
     def test_unknown_checks_and_providers(self) -> None:
-        text = "- lane: a\n  provider: p\n  model: m\n  verify-provider: q\n  verify-model: v\n  checks: [securty]\n"
-        self.fails(text, "no such check securty", checks=["security"], providers=["p", "q"])
-        self.fails(text.replace("  checks: [securty]\n", ""), "verify-provider `q` has no template", providers=["p"])
+        text = f"- lane: a\n{ONE}  checks: [securty]\n"
+        self.fails(text, "no such check securty", checks=["security"], providers=["p"])
+        self.fails(text.replace("  checks: [securty]\n", ""), "provider `p` has no template", providers=["q"])
 
     def test_not_the_supported_yaml(self) -> None:
         self.fails("lane: a\n", "start each lane with `- `")
@@ -118,11 +102,26 @@ class Errors(unittest.TestCase):
         self.fails("", "no lane given")
 
 
+class Verifier(unittest.TestCase):
+    def test_complete(self) -> None:
+        g.validate_verifier("p", "v", "q", "b", providers=["p", "q"])
+        g.validate_verifier("p", "v")
+
+    def test_errors(self) -> None:
+        for args, message in (
+            (("p", ""), "both required"),
+            (("p", "v", "q", ""), "both verify-backup-provider and verify-backup-model"),
+            (("p", "v", "q", "b"), "verify-backup-provider `q` has no template"),
+        ):
+            with self.subTest(args=args), self.assertRaisesRegex(g.LanesError, message):
+                g.validate_verifier(*args, providers=["p"])
+
+
 class Command(unittest.TestCase):
-    def run_lanes(self, text: str, cwd: Path) -> subprocess.CompletedProcess:
+    def run_lanes(self, text: str, cwd: Path, *more: str) -> subprocess.CompletedProcess:
         output = cwd / "output"
         done = subprocess.run(
-            [sys.executable, str(ROOT / "goose_review.py"), "lanes"], cwd=cwd, capture_output=True, text=True,
+            [sys.executable, str(ROOT / "goose_review.py"), "lanes", *more], cwd=cwd, capture_output=True, text=True,
             env={**os.environ, "GOOSE_REVIEW_LANES": text, "GITHUB_OUTPUT": str(output)},
         )
         done.output = output.read_text() if output.exists() else ""
@@ -136,17 +135,20 @@ class Command(unittest.TestCase):
         (repo / ".github" / "goose" / "providers").mkdir(parents=True)
         for name in ("notedthat_thirdparty", "notedthat_minimax"):
             (repo / ".github" / "goose" / "providers" / f"{name}.json").write_text("{}")
-        done = self.run_lanes(YAML, repo)
+        verifier = ("--verify-provider", "notedthat_minimax", "--verify-model", "MiniMax-M3")
+        done = self.run_lanes(YAML, repo, *verifier)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertTrue(done.output.startswith("lanes=[") and done.output.count("\n") == 1)
         self.assertEqual(json.loads(done.output[len("lanes="):])[0], FIRST)
-        self.assertIn("lane minimax: MiniMax-M3 reviews, deepseek-v4-flash-0731 verifies; checks security, correctness",
-                      done.stderr)
+        self.assertIn("lane minimax: MiniMax-M3 reviews; checks security, correctness", done.stderr)
+        self.assertIn("MiniMax-M3 verifies every lane's findings", done.stderr)
+        done = self.run_lanes(YAML, repo, "--verify-provider", "nowhere", "--verify-model", "v")
+        self.assertIn("::error::verify-provider `nowhere` has no template", done.stderr)
 
     def test_an_error_is_annotated(self) -> None:
         done = self.run_lanes("- lane: a\n  provider: p\n", Path(tempfile.mkdtemp()))
         self.assertEqual(done.returncode, 1)
-        self.assertIn("::error::lane 1 (a): missing model, verify-provider, verify-model", done.stderr)
+        self.assertIn("::error::lane 1 (a): missing model", done.stderr)
         self.assertEqual(done.output, "")
 
 

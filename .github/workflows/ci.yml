@@ -27,7 +27,7 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Shellcheck
-        run: shellcheck render-provider.sh setup-providers.sh options.sh scripts/*.sh tests/e2e/setup.sh
+        run: shellcheck install.sh render-provider.sh setup-providers.sh options.sh scripts/*.sh tests/e2e/setup.sh
 
       - name: Actionlint
         env:
@@ -41,7 +41,7 @@ jobs:
           tar xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
 
-      # review.yml and lane.yml pin this repository's actions; every pin
+      # review.yml pins this repository's actions; every pin
       # must carry exactly HEAD's action code.
       - name: Check the pins
         run: scripts/check-pins.sh

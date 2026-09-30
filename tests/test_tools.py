@@ -180,7 +180,7 @@ class Command(unittest.TestCase):
         self.assertIn("::error::tool 1 (t): missing url, sha256, use", done.stderr)
 
     def test_the_lanes_command_checks_the_tools_too(self) -> None:
-        lanes = "- lane: a\n  provider: p\n  model: m\n  verify-provider: p\n  verify-model: v\n"
+        lanes = "- lane: a\n  provider: p\n  model: m\n"
         done = subprocess.run([sys.executable, str(ROOT / "goose_review.py"), "lanes"], cwd=tempfile.mkdtemp(),
                               capture_output=True, text=True,
                               env={**os.environ, "GOOSE_REVIEW_LANES": lanes, "GOOSE_REVIEW_TOOLS": "- name: t\n",

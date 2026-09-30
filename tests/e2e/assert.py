@@ -6,10 +6,10 @@ Always: the summary comment is the pull request's last item (no review or
 comment after it) and names this run.
 
 When the pull request carries the fixture (a GOOSE-REVIEW-E2E line under
-tests/e2e/fixture/): one open thread on it, not one per lane -- the slow
-lane replied in the first lane's thread -- signed by both reviewing
-models, and the backup verifier confirmed the lane whose verifier answered
-empty.
+tests/e2e/fixture/): one open thread on it, not one per lane -- both
+lanes found the line, and the second lane's finding is a reply in the
+first's thread -- signed by both reviewing models, and the backup
+verifier confirmed the lane whose verifier answered empty.
 
 Usage: GH_TOKEN=... assert.py --repo o/r --pr N --run-id ID --fixture PATH
 """

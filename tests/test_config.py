@@ -193,13 +193,18 @@ class GitHubEndpoints(unittest.TestCase):
             g.github("GET", "/repos/o/r", "t")
         self.assertEqual(seen, ["https://ghe.example/api/v3/repos/o/r"])
 
-    def test_job_names_nested_or_not(self) -> None:
-        self.assertEqual(g.job_lane("deepseek / review"), ("deepseek", "review"))
-        self.assertEqual(g.job_lane("goose-review / lanes / deepseek / post"), ("deepseek", "post"))
-        self.assertEqual(g.job_lane("tidy"), ("", ""))
-        self.assertEqual(g.job_lane("goose-review / 3 deepseek / review"), ("deepseek", "review"))
-        self.assertEqual(g.job_lane("goose-review / 3 deepseek / review → post"), ("deepseek", "post"))
-        self.assertNotIn(g.job_lane("goose-review / 2 tidy")[1], ("review", "post"))
+    def test_job_kinds_nested_or_not(self) -> None:
+        self.assertEqual(g.job_kind("review (deepseek)"), ("review", "deepseek"))
+        self.assertEqual(g.job_kind("goose-review / review (deepseek)"), ("review", "deepseek"))
+        self.assertEqual(g.job_kind("goose-review / verify"), ("verify", ""))
+        self.assertEqual(g.job_kind("post"), ("post", ""))
+        self.assertEqual(g.job_kind("goose-review / plan"), ("", ""))
+        self.assertEqual(g.job_kind("tidy"), ("", ""))
+
+    def test_a_lanes_jobs(self) -> None:
+        jobs = {"review": {"a": {"id": 1}, "b": {"id": 2}}, "verify": {"": {"id": 3}}, "post": {"": {"id": 4}}}
+        self.assertEqual(g.lane_jobs(jobs, "b"), {"review": {"id": 2}, "verify": {"id": 3}, "post": {"id": 4}})
+        self.assertEqual(g.lane_jobs(jobs, "c"), {"verify": {"id": 3}, "post": {"id": 4}})
 
 
 class Providers(unittest.TestCase):

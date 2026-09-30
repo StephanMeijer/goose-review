@@ -5,9 +5,9 @@
 # runs. Needs the full history (fetch-depth: 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-code=(lanes tools review post tidy summary goose_review.py setup-providers.sh render-provider.sh options.sh)
-pins=$(grep -hoE 'StephanMeijer/goose-review/(lanes|tools|review|post|tidy|summary)@[0-9a-f]{40}' \
-  .github/workflows/review.yml .github/workflows/lane.yml | sed 's/.*@//' | sort -u)
+code=(lanes tools review verify post tidy goose_review.py install.sh setup-providers.sh render-provider.sh options.sh)
+pins=$(grep -hoE 'StephanMeijer/goose-review/(lanes|tools|review|verify|post|tidy)@[0-9a-f]{40}' \
+  .github/workflows/review.yml | sed 's/.*@//' | sort -u)
 if [ -z "$pins" ]; then
   echo "::error::the reusable workflows pin none of their actions" >&2
   exit 1
