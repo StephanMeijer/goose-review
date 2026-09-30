@@ -1,10 +1,10 @@
 # shellcheck shell=bash
-# Sourced by the review action's review and verify steps: turns the
+# Sourced by the review action's review step: turns the
 # caller's settings (in the environment, never interpolated into a script)
 # into goose_review.py options. One glob per line for IGNORE (blank lines
 # and surrounding whitespace dropped); CHECKS as described below.
 #
-# Sets `options` (shared by review and verify) and `checks` (review only).
+# Sets `options` and `checks`.
 
 lines() {
   local line

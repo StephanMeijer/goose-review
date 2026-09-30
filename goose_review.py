@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""LLM review of a pull request with Goose, in three steps.
+"""LLM review of a pull request with Goose.
 
   review  run every check in the checks directory (default .agents/checks/)
-          over the diff, one `goose run` per check, and write the findings
-          as JSON lines;
-  verify  have a second model re-check each finding against the code and
-          keep only the ones it confirms;
-  post    publish what is left as one GitHub pull request review.
+          over the diff, one `goose run` per check. A check reports each
+          finding as it establishes it with the `post_comment` tool (`mcp`):
+          a second model verifies it then and there, the reviewer hears
+          whether it was posted or denied and why, and a confirmed finding
+          goes to the poster;
+  poster  post each confirmed finding on the pull request as it comes,
+          from a process of its own the model cannot reach;
+  post    finish a lane: post what the poster did not get, and count what
+          the lane posted for the summary.
 
 Why not `goose review`: it runs each check with `--no-profile` and no
 extensions, so the model sees the diff and nothing else -- it cannot open a
@@ -49,7 +53,7 @@ from pathlib import Path
 @dataclass
 class Config:
     """What the caller composes: set once from the command line by
-    `configure`, read by the review and verify steps."""
+    `configure`, read by the review and by each post_comment server."""
     checks_dir: Path = Path(".agents/checks")
     # Only these checks, by name; empty means every check in checks_dir.
     only_checks: tuple[str, ...] = ()
@@ -58,7 +62,7 @@ class Config:
     # paths. A missing directory means no facts.
     facts_dir: Path = Path(".agents/facts")
     # Globs never reviewed (build output, lock files, generated files);
-    # review and verify must be given the same list, as both diff.
+    # the checks and the verifier see the same diff.
     ignore: tuple[str, ...] = ()
     # Appended to TOOLS: the project's own commands (a toolchain, where the
     # dependencies' sources are, what not to run).
@@ -80,9 +84,9 @@ MAX_DIFF_CHARS = 60_000
 
 # Time, not turns, bounds the review: a check keeps investigating in rounds
 # of its `turn-limit` turns for as long as its share of the phase's budget
-# lasts, and is then asked for its answer. The workflow gives the review
-# phase and the verify phase a budget each (--budget-minutes) so a lane
-# fits its job's timeout.
+# lasts, and is then asked to finish. The verification of each finding it
+# posts happens within that time (--budget-minutes), so a lane fits its
+# job's timeout.
 FINAL_MARGIN_S = 4 * 60  # kept back at the end for the answer itself
 # A run's rounds end when its share is used, but its first round gets at
 # least this long; a run that cannot have it before FINAL_MARGIN_S is not
@@ -138,11 +142,10 @@ class ProviderDown(Exception):
 # more round to look again before its answer counts.
 SECOND_LOOK_FRACTION = 0.25
 SECOND_LOOK_PROMPT = (
-    "Before this answer counts, take a second look. Go through every changed hunk in "
-    "the diff and say to yourself whether you opened the code around it and what "
-    "calls it; open what you skipped, and the tests that pin its behaviour. Then give "
-    "the JSON answer described in the first message again, complete: keep the findings "
-    "that still hold, drop those that do not, add what you found.\n"
+    "Before you finish, take a second look. Go through every changed hunk in the diff "
+    "and say to yourself whether you opened the code around it and what calls it; open "
+    "what you skipped, and the tests that pin its behaviour. Post with `post_comment` "
+    'what you find that you have not posted yet, then answer with only {"done": true}.\n'
 )
 JSON_PROMPT = (
     "Your last message did not contain the JSON answer. Give it now: only the JSON "
@@ -154,7 +157,16 @@ RESUME_PROMPT = (
     "off, and end with the JSON answer described in the first message.\n"
 )
 
-VERIFY_BATCH = 4
+# A reviewer reports each finding as it establishes it, through the
+# `post_comment` tool, and hears back at once whether a second model
+# confirmed it; it ends with {"done": true}. FINAL_PROMPT is the verifier's.
+FINAL_REVIEW_PROMPT = (
+    "Your time for this review is up. Stop investigating now. Post with `post_comment` "
+    "any finding you have established but not posted yet, then answer with only "
+    '{"done": true}.\n'
+)
+
+
 VERIFY_TURNS = 40
 
 SEVERITIES = ["low", "medium", "high", "critical"]
@@ -213,16 +225,26 @@ def tools_prompt(base: str) -> str:
     return (TOOLS.format(base=base) + (f"\n{installed}" if installed else "")
             + (f"\n{extra}\n" if extra else ""))
 
-OUTPUT_CONTRACT = """\
-## Output
+TOOL_CONTRACT = """\
+## Reporting
 
-When you are done investigating, answer with ONLY this JSON object and
-nothing else -- no prose before or after it, no code fences:
+Report each finding as soon as you have established it, by calling the
+`post_comment` tool -- one call per finding, not all of them at the end:
 
-{"findings": [{"severity": "low|medium|high|critical", "path": "repo/relative/path", "line_start": 10, "line_end": 12, "summary": "What is wrong, why, and the fix."}]}
+- `severity`: `low`, `medium`, `high` or `critical`;
+- `path`, `line_start`, `line_end`: post-change line numbers from the diff,
+  on lines the diff adds or changes (lines starting with `+`);
+- `summary`: what is wrong, why, and the fix.
 
-Use post-change line numbers from the diff, and report only lines the diff
-adds or changes (lines starting with `+`). No findings: {"findings": []}
+Before a finding is posted, a second model checks it against the code. The
+tool answers with its verdict: posted, or denied and why. When it is
+denied, read the reason. If it shows the finding was wrong, drop it and
+carry on. If the reason itself is wrong and the code shows it, you may post
+the finding once more with that evidence in the summary; not a third time.
+Do not post the same problem twice.
+
+When you have finished reviewing, answer with ONLY this JSON object and
+nothing else: {"done": true}
 """
 
 # Findings on NotedThat#207 kept resting on "if the secret held a query string" or
@@ -607,7 +629,7 @@ def cmd_lanes(args: argparse.Namespace) -> None:
 
 
 def configure(args: argparse.Namespace) -> None:
-    """Set CONFIG from the review and verify steps' shared options."""
+    """Set CONFIG from the review's options."""
     global CONFIG
     CONFIG = replace(
         CONFIG,
@@ -869,7 +891,8 @@ def goose_env(data: str) -> dict[str, str]:
 
 
 def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: str,
-              deadline: float, share_s: float, answer_key: str) -> str | None:
+              deadline: float, share_s: float, answer_key: str, extensions: tuple[str, ...] = (),
+              final_margin: float = FINAL_MARGIN_S) -> str | None:
     """One headless Goose review run with the developer extension.
 
     Returns the text of the model's final message, or None when the run did
@@ -891,6 +914,12 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
     Raises ProviderDown when EMPTY_ROUNDS_LIMIT rounds in a row came back
     empty without using a token.
 
+    `final_margin` is the time kept back for the answer (a verification
+    inside a tool call has less than FINAL_MARGIN_S in all).
+
+    `extensions` are stdio MCP servers (`name:command`) added next to the
+    developer extension: a tool-driven review's `post_comment`.
+
     With GOOSE_REVIEW_LOG_DIR set, each round's prompt and full JSON
     transcript (tool calls included) are kept there.
     """
@@ -898,6 +927,7 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
         return [
             "--no-profile", "--quiet",
             "--with-builtin", "developer",
+            *(arg for extension in extensions for arg in ("--with-extension", extension)),
             "--provider", provider, "--model", model,
             "--max-turns", str(turns),
             "--output-format", "json",
@@ -911,8 +941,9 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
         # keeps it so should that change. Nor a GitHub token, should one be
         # set for the whole job.
         # Nor the paths of the step's file commands (GITHUB_ENV, GITHUB_PATH,
-        # ...). The model can still find those files; only `post`, on its own
-        # runner, is out of its reach, and it scrubs again before publishing.
+        # ...). The model can still find those files; only the poster (another
+        # user) and `post` (its own runner) are out of its reach, and both
+        # scrub before publishing.
         # The provider settings arrive as a whole; Goose gets only the
         # environment its providers name.
         env = goose_env(data)
@@ -921,7 +952,8 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
         finalising = False
         asked_for_json = False
         first_answer = None
-        second_look = answer_key != "findings"  # verification answers are not re-asked
+        final_prompt = FINAL_REVIEW_PROMPT if answer_key == "done" else FINAL_PROMPT
+        second_look = answer_key != "done"  # verification answers are not re-asked
         rate_limited = 0
         round_no = 0
         # The transcript's token count is the session's so far: a round that
@@ -939,7 +971,7 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
             # it), and early enough to leave time for the answer before the
             # deadline; the answering round may use what is left.
             share_end = started + max(share_s, MIN_ROUND_S)
-            limit = remaining if finalising else min(share_end, deadline - FINAL_MARGIN_S) - time.monotonic()
+            limit = remaining if finalising else min(share_end, deadline - final_margin) - time.monotonic()
             try:
                 if limit <= 0:
                     if round_no == 1:
@@ -958,11 +990,11 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
                 # Goose keeps the session as it goes, so what the run read so
                 # far is still there to answer from -- a second look's too,
                 # which would be lost by falling back to the first answer.
-                why = "its time share is used" if share_end < deadline - FINAL_MARGIN_S else "near the deadline"
+                why = "its time share is used" if share_end < deadline - final_margin else "near the deadline"
                 print(f"::notice::{label}: investigation cut off, {why}; asking for the answer", file=sys.stderr)
                 finalising = True
                 command = ["goose", "run", "--resume", "-n", session, *common(FINAL_TURNS), "-i", "-"]
-                stdin = FINAL_PROMPT
+                stdin = final_prompt
                 continue
             log(label, round_no, stdin, stdout, stderr)
 
@@ -996,10 +1028,11 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
             if any(e in error.lower() for e in SPENT_ERRORS):
                 raise ProviderDown(f"{model}'s provider refused the request, its key's limit is spent: {redact(error)[:200]}")
             if status == "completed" and final and not errored and not out_of_turns:
-                answered = last_json_object(final, answer_key) is not None
+                # A reviewer's findings are posted as it goes: any last message ends it.
+                answered = answer_key == "done" or last_json_object(final, answer_key) is not None
                 elapsed = time.monotonic() - started
                 if answered and not second_look and not finalising \
-                        and elapsed < share_s * SECOND_LOOK_FRACTION and deadline - time.monotonic() > FINAL_MARGIN_S:
+                        and elapsed < share_s * SECOND_LOOK_FRACTION and deadline - time.monotonic() > final_margin:
                     print(f"::notice::{label}: answered after {round(elapsed)}s, asking for a second look", file=sys.stderr)
                     second_look = True
                     command = ["goose", "run", "--resume", "-n", session, *common(round_turns), "-i", "-"]
@@ -1021,12 +1054,12 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
             now = time.monotonic()
             resume = ["goose", "run", "--resume", "-n", session]
             if out_of_turns and not finalising:
-                if now - started < share_s and deadline - now > FINAL_MARGIN_S:
+                if now - started < share_s and deadline - now > final_margin:
                     command, stdin = [*resume, *common(round_turns), "-i", "-"], CONTINUE_PROMPT
                 else:
                     print(f"::notice::{label}: time share used after {round(now - started)}s, asking for the answer", file=sys.stderr)
                     finalising = True
-                    command, stdin = [*resume, *common(FINAL_TURNS), "-i", "-"], FINAL_PROMPT
+                    command, stdin = [*resume, *common(FINAL_TURNS), "-i", "-"], final_prompt
                 continue
             # stderr or the final message carries Goose's own error; stdout
             # would also match text in the prompt.
@@ -1036,7 +1069,7 @@ def run_goose(prompt: str, provider: str, model: str, round_turns: int, label: s
                 print(f"::notice::{label}: provider busy or rate-limited, resuming in {RATE_LIMIT_WAIT_S}s ({rate_limited})", file=sys.stderr)
                 time.sleep(RATE_LIMIT_WAIT_S)
                 command = [*resume, *common(FINAL_TURNS if finalising else round_turns), "-i", "-"]
-                stdin = FINAL_PROMPT if finalising else RESUME_PROMPT
+                stdin = final_prompt if finalising else RESUME_PROMPT
                 continue
             if first_answer:
                 print(f"::notice::{label}: second look gave no answer; keeping the first", file=sys.stderr)
@@ -1165,16 +1198,24 @@ class FairShare:
 
 
 def cmd_review(args: argparse.Namespace) -> None:
+    """Run each check that covers the change as its own Goose run. A check
+    reports each finding as it establishes it through the `post_comment`
+    tool (`cmd_mcp`), which has a second model verify it then and there
+    and, with a poster running (`cmd_poster`), posts it. What was confirmed
+    but not posted goes to `--out`, for `post`; every call and its outcome
+    to `--calls`."""
     configure(args)
     checks = selected_checks()
     diff = git_diff(args.base)
     out = Path(args.out)
+    calls = Path(args.calls) if args.calls else out.with_name("calls.jsonl")
     Path(args.status).unlink(missing_ok=True)
+    out.write_text("")
+    calls.unlink(missing_ok=True)
     if not diff.strip():
         # Every changed file is excluded or deleted: nothing was reviewed,
         # which must not read as a clean review.
-        out.write_text("")
-        write_status(args.status, checks_run=[], checks_skipped=[c.name for c in checks], checks_failed=[])
+        write_status(args.status, checks_run=[], checks_skipped=[c.name for c in checks], checks_failed=[], found=0)
         print("no reviewable change (every file excluded or deleted)", file=sys.stderr)
         return
     context = pr_context(args.context)
@@ -1203,7 +1244,7 @@ def cmd_review(args: argparse.Namespace) -> None:
                 "shows a file as it was before.\n\n"
                 "{time_budget}"  # filled in when the run starts
                 f"{context}{check.body}\n\n{rules_prompt()}\n{facts}"
-                f"{tools_prompt(base_sha)}\n{OUTPUT_CONTRACT}\n## Diff\n\n```diff\n{batch}```\n"
+                f"{tools_prompt(base_sha)}\n{TOOL_CONTRACT}\n## Diff\n\n```diff\n{batch}```\n"
             )
             by_check[-1].append((check, f"{check.name}#{i}", prompt))
     # The checks take turns (correctness#0, security#0, correctness#1, ...):
@@ -1211,15 +1252,33 @@ def cmd_review(args: argparse.Namespace) -> None:
     # check rather than for all of the last check's.
     jobs = [job for turn in itertools.zip_longest(*by_check) for job in turn if job]
 
-    findings: list[dict] = []
     failed: set[str] = set()
     unstarted: dict[str, int] = {}
     answered = 0
     down: list[ProviderDown] = []   # once the model is down, the runs still queued do not start
     shares = FairShare(deadline, args.jobs, len(jobs))
+    # Each run's post_comment server gets its settings in a file: the
+    # checks' posted findings (so one check does not post what another
+    # did), the calls log and `out` are shared by all of them.
+    work = Path(tempfile.mkdtemp(prefix="goose-review-tools-"))
+    verifiers = [(args.verify_provider, args.verify_model)] + (
+        [(args.backup_provider, args.backup_model)] if args.backup_model else [])
+    wall_deadline = time.time() + (deadline - time.monotonic())
+    config = {k: getattr(args, k) for k in ("checks_dir", "check", "facts_dir", "ignore", "tools_file", "tools", "rules_file")}
+
+    def extension(label: str) -> str:
+        spec = work / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', label)}.json"
+        spec.write_text(json.dumps({
+            "base": args.base, "verifiers": verifiers, "context": args.context, "answered": args.answered,
+            "config": config, "deadline": wall_deadline, "check": label.split("#")[0], "label": label,
+            "posted": str(work / "posted.jsonl"), "calls": str(calls.resolve()), "pending": str(out.resolve()),
+            "poster": args.poster_socket or None,
+        }))
+        # Goose splits the command on whitespace: the paths must have none.
+        return f"review:{sys.executable} {Path(__file__).resolve()} mcp --spec {spec}"
 
     def run(check: Check, label: str, prompt: str) -> tuple[bool, str | None]:
-        """Whether the run started, and its answer."""
+        """Whether the run started, and its last message."""
         share_s = shares.start()
         try:
             if down:
@@ -1227,7 +1286,8 @@ def cmd_review(args: argparse.Namespace) -> None:
             if deadline - time.monotonic() < FINAL_MARGIN_S + MIN_ROUND_S:
                 return False, None
             prompt = prompt.replace("{time_budget}", time_budget(share_s / 60), 1)
-            return True, run_goose(prompt, args.provider, args.model, check.turn_limit, label, deadline, share_s, "findings")
+            return True, run_goose(prompt, args.provider, args.model, check.turn_limit, label, deadline, share_s, "done",
+                                   (extension(label),))
         finally:
             shares.finish()
 
@@ -1246,53 +1306,32 @@ def cmd_review(args: argparse.Namespace) -> None:
                 print(f"::warning::{label}: not started: the time budget was spent before its turn", file=sys.stderr)
                 failed.add(check.name)
                 unstarted[check.name] = unstarted.get(check.name, 0) + 1
-                continue
-            answer = last_json_object(text, "findings") if text else None
-            if answer is None:
-                print(f"::warning::{label}: no findings JSON in the answer; check did not finish", file=sys.stderr)
+            elif not text:
+                # What it posted before it stopped stays posted.
+                print(f"::warning::{label}: ended without finishing its review", file=sys.stderr)
                 failed.add(check.name)
-                continue
-            answered += 1
-            for raw in answer.get("findings") or []:
-                if isinstance(raw, dict) and (f := normalise(raw, check.name)):
-                    findings.append(f)
-            print(f"{label}: {len(answer.get('findings') or [])} finding(s)", file=sys.stderr)
+            else:
+                answered += 1
 
-    merged = merge_overlapping(findings)
-    print(f"{len(findings)} finding(s), {len(merged)} after merging overlaps", file=sys.stderr)
-    out.write_text("".join(json.dumps(f) + "\n" for f in merged))
-    write_status(args.status, checks_run=ran, checks_skipped=skipped, checks_failed=sorted(failed), checks_unstarted=unstarted)
+    tried = Locked(str(calls)).read()
+    outcomes = {o: sum(1 for c in tried if c["outcome"] == o) for o in dict.fromkeys(c["outcome"] for c in tried)}
+    print(f"post_comment: {len(tried)} call(s), {outcomes}", file=sys.stderr)
+    denied = [c for c in tried if c["outcome"] == "denied"]
+    write_status(
+        args.status, checks_run=ran, checks_skipped=skipped, checks_failed=sorted(failed), checks_unstarted=unstarted,
+        # What the model raised: every call that carried a finding.
+        found=sum(1 for c in tried if c["outcome"] not in ("invalid", "limit")),
+        posted=outcomes.get("posted", 0), pending=outcomes.get("pending", 0), refused=outcomes.get("refused", 0),
+        rejected=len(denied), repeated=sum(1 for c in denied if c.get("repeat")),
+        unevidenced=sum(1 for c in denied if c.get("unevidenced")),
+        withheld=outcomes.get("withheld", 0) + outcomes.get("no-time", 0),
+        duplicates=outcomes.get("duplicate", 0), outside=outcomes.get("outside", 0),
+        # The models that gave verdicts, the verifier first: what the summary
+        # shows as "Verified by".
+        verified_by=[m for _, m in verifiers if any(c.get("verified_by") == m for c in tried)],
+    )
     if down and not answered:
         write_status(args.status, error=str(down[0]))
-
-
-def merge_overlapping(findings: list[dict]) -> list[dict]:
-    """One finding per place in the code.
-
-    Several checks often report the same defect from their own angle (a
-    WebDAV verb mapped wrongly is an access-rules, security, correctness and
-    api-contract finding at once). Findings on the same file whose line
-    ranges overlap, or sit within two lines of each other, become one: the
-    most severe leads, and the others ride along in `also` so their notes
-    are still shown.
-    """
-    groups: list[list[dict]] = []
-    for f in sorted(findings, key=lambda f: (f["path"], f["line_start"], f["line_end"])):
-        last = groups[-1] if groups else None
-        if last and last[0]["path"] == f["path"] and f["line_start"] <= max(g["line_end"] for g in last) + 2:
-            last.append(f)
-        else:
-            groups.append([f])
-    merged = []
-    for group in groups:
-        group.sort(key=lambda f: -SEVERITIES.index(f["severity"]))
-        lead = dict(group[0])
-        lead["line_start"] = min(g["line_start"] for g in group)
-        lead["line_end"] = max(g["line_end"] for g in group)
-        lead["also"] = [{k: g[k] for k in ("check", "severity", "summary")} for g in group[1:]]
-        merged.append(lead)
-    merged.sort(key=lambda f: (-SEVERITIES.index(f["severity"]), f["path"], f["line_start"]))
-    return merged
 
 
 def redact(text: str) -> str:
@@ -1545,31 +1584,45 @@ def cmd_preflight(args: argparse.Namespace) -> None:
         raise SystemExit(f"::error::{why}")
 
 
-def cmd_verify(args: argparse.Namespace) -> None:
-    configure(args)
-    findings = read_findings(args.input)
-    out = Path(args.out)
-    if not findings:
-        out.write_text("")
-        write_status(args.status, verify="nothing to verify")
-        return
-    diff = git_diff(args.base)
-    base_sha = subprocess.run(
-        ["git", "merge-base", args.base, "HEAD"], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    files = diff_files(diff)
-    answered = json.loads(Path(args.answered).read_text(encoding="utf-8")) if args.answered and Path(args.answered).exists() else []
-    answered_ids = {a["id"] for a in answered}
-    facts = facts_section([path for path, _ in files])
+@dataclass
+class Verdicts:
+    """What a verifier made of a batch of findings."""
+    model: str                  # the model that gave the verdicts
+    kept: list[dict]            # confirmed, each with `verified_by`
+    reasons: dict[int, str]     # why each finding not kept was not, by its index in the batch
+    unjudged: int               # no verdict at all: withheld, not refuted
+    repeats: int                # rejected as a repeat of an answered finding
+    unevidenced: int            # kept without evidence that checks out, so dropped
 
-    def batch_diff(batch: list[dict]) -> str:
+
+class Verifier:
+    """A second model re-checking findings against the checkout, one
+    `post_comment` call at a time."""
+
+    def __init__(self, base: str, verifiers: list[tuple[str, str]], context: str | None, answered_path: str | None) -> None:
+        self.files = diff_files(git_diff(base))
+        self.base_sha = subprocess.run(
+            ["git", "merge-base", base, "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        self.answered = (json.loads(Path(answered_path).read_text(encoding="utf-8"))
+                         if answered_path and Path(answered_path).exists() else [])
+        self.answered_ids = {a["id"] for a in self.answered}
+        self.facts = facts_section([path for path, _ in self.files])
+        self.context = pr_context(context)
+        # The backup verifies what the verifier cannot: every batch once the
+        # verifier's provider is found down (ProviderDown), and a batch the
+        # verifier gave no verdicts for.
+        self.verifiers = verifiers
+        self.down: set[str] = set()
+
+    def batch_diff(self, batch: list[dict]) -> str:
         """The hunks this batch's findings are on, not the whole change nor
         whole files: on a large change a cut-off diff may not hold them,
         and the verifier would then reject real findings as being about
         unchanged code. The verifier reads the rest from the checkout."""
         parts = [
             finding_hunks(chunk, own)
-            for path, chunk in files
+            for path, chunk in self.files
             if (own := [f for f in batch if f["path"] == path])
         ]
         # Only a single hunk this large still needs cutting; each file then
@@ -1580,52 +1633,30 @@ def cmd_verify(args: argparse.Namespace) -> None:
             parts = [p if len(p) <= share else p[:share - len(note)] + note for p in parts]
         return "".join(parts)
 
-    # A few findings per run: one run over thirteen spent its whole turn
-    # budget investigating and never answered.
-    batches = [findings[i:i + VERIFY_BATCH] for i in range(0, len(findings), VERIFY_BATCH)]
-    deadline = time.monotonic() + args.budget_minutes * 60
-    shares = FairShare(deadline, args.jobs, len(batches))
-    # The backup verifies what the verifier cannot: every batch once the
-    # verifier's provider is found down (ProviderDown), and a batch the
-    # verifier gave no verdicts for. Findings are withheld only when neither answers.
-    verifiers = [(args.provider, args.model)] + ([(args.backup_provider, args.backup_model)] if args.backup_model else [])
-    down: set[str] = set()
-    verified_by: set[str] = set()
-
-    def verify_batch(n: int, batch: list[dict]) -> tuple[list[dict], int, int, int] | None:
-        share_s = shares.start()
-        try:
-            return verify_one(n, batch, share_s)
-        finally:
-            shares.finish()
-
-    def verify_one(n: int, batch: list[dict], share_s: float) -> tuple[list[dict], int, int, int] | None:
-        """The batch's confirmed findings, how many got no verdict at all,
-        how many were rejected as repeats of an answered finding, and how
-        many were kept without evidence (and so dropped); None when the
-        answer had no verdicts. Each confirmed finding says which model
-        confirmed it (`verified_by`)."""
+    def verify(self, name: str, batch: list[dict], share_s: float, deadline: float,
+               final_margin: float = FINAL_MARGIN_S) -> Verdicts | None:
+        """The verdicts on `batch`; None when no verifier gave any."""
         listing = "\n".join(
             f"{i}. [{f['severity']}] {f['path']}:{f['line_start']}-{f['line_end']} ({f['check']}): {f['summary']}"
-            + "".join(f"\n   Also raised by `{a['check']}`: {a['summary']}" for a in f.get("also", []))
             for i, f in enumerate(batch)
         )
         rest = (
-            f"{VERIFY_PROMPT}\n{rules_prompt()}\n{facts}{tools_prompt(base_sha)}\n"
-            f"{pr_context(args.context)}{answered_section(answered, {f['path'] for f in batch})}## Findings\n\n{listing}\n\n"
-            f"## Diff of the files these findings are on\n\n```diff\n{batch_diff(batch)}```\n"
+            f"{VERIFY_PROMPT}\n{rules_prompt()}\n{self.facts}{tools_prompt(self.base_sha)}\n"
+            f"{self.context}{answered_section(self.answered, {f['path'] for f in batch})}## Findings\n\n{listing}\n\n"
+            f"## Diff of the files these findings are on\n\n```diff\n{self.batch_diff(batch)}```\n"
         )
         started, answer, model = time.monotonic(), None, None
-        for provider, candidate in verifiers:
-            if candidate in down:
+        for n, (provider, candidate) in enumerate(self.verifiers):
+            if candidate in self.down:
                 continue
             # A backup gets what is left of the batch's share.
             left = max(share_s - (time.monotonic() - started), MIN_ROUND_S)
-            label = f"verify#{n}" if candidate == args.model else f"verify#{n} ({candidate}, backup)"
+            label = name if n == 0 else f"{name} ({candidate}, backup)"
             try:
-                text = run_goose(f"{time_budget(left / 60)}{rest}", provider, candidate, VERIFY_TURNS, label, deadline, left, "verdicts")
+                text = run_goose(f"{time_budget(left / 60)}{rest}", provider, candidate, VERIFY_TURNS, label, deadline, left,
+                                 "verdicts", final_margin=final_margin)
             except ProviderDown as error:
-                down.add(candidate)
+                self.down.add(candidate)
                 print(f"::warning::{label}: {error}", file=sys.stderr)
                 continue
             answer = last_json_object(text, "verdicts") if text else None
@@ -1636,7 +1667,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
             # nothing here is not down, and the next batch asks it first.
             print(f"::warning::{label}: no verdicts JSON in the answer", file=sys.stderr)
         if model is None:
-            print(f"::warning::verify#{n}: no verifier gave verdicts; its {len(batch)} finding(s) are withheld", file=sys.stderr)
+            print(f"::warning::{name}: no verifier gave verdicts; its {len(batch)} finding(s) are withheld", file=sys.stderr)
             return None
         verdicts = [
             v for v in answer.get("verdicts") or []
@@ -1646,50 +1677,227 @@ def cmd_verify(args: argparse.Namespace) -> None:
         # withheld as unconfirmed, like a batch that gave no answer.
         unjudged = len(set(range(len(batch))) - {int(v["index"]) for v in verdicts})
         if unjudged:
-            print(f"::warning::verify#{n}: no verdict for {unjudged} of {len(batch)} finding(s); they are withheld", file=sys.stderr)
-        repeats = sum(1 for v in verdicts if not v["keep"] and v.get("repeats") in answered_ids)
-        kept, unevidenced = [], 0
+            print(f"::warning::{name}: no verdict for {unjudged} of {len(batch)} finding(s); they are withheld", file=sys.stderr)
+        repeats = sum(1 for v in verdicts if not v["keep"] and v.get("repeats") in self.answered_ids)
+        kept, reasons, unevidenced = [], {}, 0
         seen: set[int] = set()
         for v in verdicts:
             i = int(v["index"])
             # A second verdict on the same finding would post it twice.
-            if not v["keep"] or i >= len(batch) or i in seen:
+            if i >= len(batch) or i in seen:
                 continue
             seen.add(i)
+            if not v["keep"]:
+                reasons[i] = str(v.get("reason") or "no reason given").strip()
+                continue
             confirmed = confirm(batch[i], v)
             if confirmed is None:
                 unevidenced += 1
-                print(f"::warning::verify#{n}: finding {i} kept without evidence that checks out; dropped", file=sys.stderr)
+                reasons[i] = "kept, but without a trigger and a quote of the defective line that is really on the line named"
+                print(f"::warning::{name}: finding {i} kept without evidence that checks out; dropped", file=sys.stderr)
             else:
                 kept.append({**confirmed, "verified_by": model})
-        verified_by.add(model)
-        return kept, unjudged, repeats, unevidenced
+        return Verdicts(model, kept, reasons, unjudged, repeats, unevidenced)
 
-    kept: list[dict] = []
-    withheld = repeated = unevidenced = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        for batch, result in zip(batches, pool.map(verify_batch, range(len(batches)), batches)):
-            if result is None:
-                withheld += len(batch)
-            else:
-                kept += result[0]
-                withheld += result[1]
-                repeated += result[2]
-                unevidenced += result[3]
-    kept.sort(key=lambda f: (-SEVERITIES.index(f["severity"]), f["path"], f["line_start"]))
-    downgraded = sum(1 for f in kept if "raised_as" in f)
-    print(f"verify: kept {len(kept)} of {len(findings)} finding(s), {withheld} withheld, {repeated} already answered, "
-          f"{unevidenced} without evidence, {downgraded} downgraded", file=sys.stderr)
-    out.write_text("".join(json.dumps(f) + "\n" for f in kept))
-    # The models that gave verdicts, the verifier first: what the summary
-    # shows as "Verified by".
-    used = [m for _, m in verifiers if m in verified_by]
-    if withheld == len(findings):
-        write_status(args.status, verify="failed", withheld=withheld, verified_by=used)
-    else:
-        # A repeat is a rejection too; `repeated` says how many of them.
-        write_status(args.status, verify="ok", withheld=withheld, rejected=len(findings) - len(kept) - withheld,
-                     repeated=repeated, unevidenced=unevidenced, downgraded=downgraded, verified_by=used)
+
+# --- tool-driven review: the post_comment tool -------------------------------
+
+# Goose gives up on a tool call after 300 s ("-32603: request timeout
+# after PT300S", measured on 1.52.0; a stdio extension given on the command
+# line cannot raise it). A verification inside post_comment must end well
+# within it, keeping this much for its answer.
+TOOL_CALL_S = 280
+TOOL_FINAL_MARGIN_S = 60
+# At most this many post_comment calls per run: a model that posts in a loop
+# is stopped rather than verified again and again.
+MAX_POST_CALLS = 20
+
+POST_COMMENT_TOOL = {
+    "name": "post_comment",
+    "description": (
+        "Post one finding as a review comment on the pull request. A second model first checks it "
+        "against the code; the result says whether it was posted, or denied and why."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "severity": {"type": "string", "enum": SEVERITIES},
+            "path": {"type": "string", "description": "Repository-relative path of a file this pull request changes."},
+            "line_start": {"type": "integer", "description": "First post-change line the finding is about."},
+            "line_end": {"type": "integer", "description": "Last post-change line the finding is about."},
+            "summary": {"type": "string", "description": "What is wrong, why, and the fix."},
+        },
+        "required": ["severity", "path", "line_start", "summary"],
+    },
+}
+
+
+def hunk_ranges(chunk: str) -> list[tuple[int, int]]:
+    """The post-change line ranges of one file's hunks."""
+    ranges = []
+    for m in re.finditer(r"(?m)^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", chunk):
+        start = int(m.group(1))
+        ranges.append((start, start + max(int(m.group(2) or 1), 1) - 1))
+    return ranges
+
+
+def precheck(finding: dict, files: dict[str, str], posted: list[dict]) -> tuple[str, str] | None:
+    """Why a finding is denied before any model looks at it, or None: not on
+    a changed file or its changed hunks (`outside`), or on the lines of a
+    comment already posted (`duplicate`)."""
+    path, start, end = finding["path"], finding["line_start"], finding["line_end"]
+    if path not in files:
+        return "outside", f"{path} is not a file this pull request changes; comment only on changed files."
+    ranges = hunk_ranges(files[path])
+    if not any(start <= b and a <= end for a, b in ranges):
+        shown = ", ".join(f"{a}-{b}" for a, b in ranges)
+        return "outside", (f"lines {start}-{end} of {path} are outside the changed hunks ({shown}); comment on the "
+                           "post-change lines this pull request changes.")
+    for other in posted:
+        if other["path"] == path and start <= other["line_end"] + 2 and other["line_start"] <= end + 2:
+            return "duplicate", (f"a comment is already posted at {path}:{other['line_start']}-{other['line_end']} "
+                                 f"({other['check']}): {clip(other['summary'], 300)} Do not post the same problem again.")
+    return None
+
+
+class Locked:
+    """A JSON-lines file several processes append to (one per check run)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+
+    def __enter__(self) -> "Locked":
+        import fcntl
+        self.lock = open(f"{self.path}.lock", "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.lock.close()
+
+    def read(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def append(self, record: dict) -> None:
+        with self.path.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(record) + "\n")
+
+
+def post_comment(spec: dict, verifier: Verifier, raw: dict, calls: int) -> str:
+    """One post_comment call: checked, verified, posted; its answer to the
+    model. Every call and its outcome is recorded in the calls log."""
+    started = time.time()
+    finding = normalise(raw, spec["check"]) if isinstance(raw, dict) else None
+
+    def record(outcome: str, reason: str, **extra: object) -> str:
+        with Locked(spec["calls"]) as log_file:
+            log_file.append({"check": spec["label"], "finding": finding or raw, "outcome": outcome, "reason": reason,
+                             "seconds": round(time.time() - started, 1), **extra})
+        return reason
+
+    if finding is None:
+        return record("invalid", "Denied: a finding needs `severity`, `path`, `line_start` and `summary`.")
+    if calls > MAX_POST_CALLS:
+        return record("limit", f"Denied: this review has used its {MAX_POST_CALLS} post_comment calls. "
+                               'Finish now: answer with only {"done": true}.')
+    with Locked(spec["posted"]) as posted_file:
+        denial = precheck(finding, dict(verifier.files), posted_file.read())
+    if denial:
+        return record(denial[0], f"Denied without review: {denial[1]}")
+    left = spec["deadline"] - time.time()
+    budget = min(TOOL_CALL_S, left)
+    if budget < TOOL_FINAL_MARGIN_S + MIN_ROUND_S:
+        return record("no-time", "Not verified: the review's time is nearly up, so the finding is withheld. "
+                                 'Finish now: answer with only {"done": true}.')
+    deadline = time.monotonic() + budget
+    verdicts = verifier.verify(f"{spec['label']}.post{calls}", [finding], budget, deadline, TOOL_FINAL_MARGIN_S)
+    if verdicts is None or verdicts.unjudged:
+        return record("withheld", "Not verified: the second reviewer gave no verdict, so the finding is withheld. "
+                                  "Do not post it again.")
+    if not verdicts.kept:
+        return record("denied", f"Denied by the second reviewer ({verdicts.model}): {verdicts.reasons.get(0, 'no reason given')}",
+                      verified_by=verdicts.model, repeat=bool(verdicts.repeats), unevidenced=bool(verdicts.unevidenced))
+    confirmed = verdicts.kept[0]
+    with Locked(spec["posted"]) as posted_file:
+        # Another check may have posted on these lines while this one was verified.
+        if denial := precheck(finding, dict(verifier.files), posted_file.read()):
+            return record(denial[0], f"Denied: {denial[1]}")
+        posted_file.append(confirmed)
+    lowered = (f" The second reviewer lowered its severity to {confirmed['severity']}: "
+               f"{confirmed.get('severity_reason') or 'no reason given'}.") if "raised_as" in confirmed else ""
+    where = f"{finding['path']}:{finding['line_start']}-{finding['line_end']}"
+    if spec.get("poster"):
+        try:
+            answer = send_to_poster(spec["poster"], confirmed)
+        except (OSError, ValueError) as error:
+            print(f"::warning::{spec['label']}: the poster could not be reached ({error}); posting at the end",
+                  file=sys.stderr)
+        else:
+            if answer.get("ok"):
+                return record("posted", f"Posted at {where}, confirmed by {confirmed['verified_by']}.{lowered}",
+                              verified_by=confirmed["verified_by"], url=answer.get("url"))
+            return record("refused", f"Confirmed, but not posted: {answer.get('reason') or 'no reason given'}",
+                          verified_by=confirmed["verified_by"])
+    with Locked(spec["pending"]) as pending:
+        pending.append(confirmed)
+    return record("pending", f"Confirmed by {confirmed['verified_by']}; it is posted at {where} when the review "
+                             f"ends.{lowered}", verified_by=confirmed["verified_by"])
+
+
+def cmd_mcp(args: argparse.Namespace) -> None:
+    """The post_comment tool, as a stdio MCP server for one check's Goose
+    run (`review --tool-driven` starts it through --with-extension).
+    Newline-delimited JSON-RPC; tool calls run in threads, so a ping is
+    answered while a verification runs."""
+    spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    configure(argparse.Namespace(**spec["config"]))
+    verifier = Verifier(spec["base"], [tuple(v) for v in spec["verifiers"]], spec["context"], spec["answered"])
+    write_lock = threading.Lock()
+    calls = itertools.count(1)
+
+    def send(message: dict) -> None:
+        with write_lock:
+            sys.stdout.write(json.dumps(message) + "\n")
+            sys.stdout.flush()
+
+    def call(request: dict) -> None:
+        params = request.get("params") or {}
+        if params.get("name") != "post_comment":
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "unknown tool"}})
+            return
+        try:
+            text = post_comment(spec, verifier, params.get("arguments") or {}, next(calls))
+        except Exception as error:  # the model gets an answer, whatever went wrong
+            text = f"Not posted: the tool failed ({type(error).__name__}); the finding is withheld."
+            print(f"::warning::{spec['label']}: post_comment failed: {error!r}", file=sys.stderr)
+        send({"jsonrpc": "2.0", "id": request["id"],
+              "result": {"content": [{"type": "text", "text": text}], "isError": False}})
+
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(request, dict) or "id" not in request:
+            continue  # a notification
+        method = request.get("method")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": request["id"], "result": {
+                "protocolVersion": (request.get("params") or {}).get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "goose-review", "version": "1"},
+            }})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": request["id"], "result": {"tools": [POST_COMMENT_TOOL]}})
+        elif method == "tools/call":
+            threading.Thread(target=call, args=(request,), daemon=True).start()
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": request["id"], "result": {}})
+        else:
+            # Goose 1.52 asks `server/discover` first and falls back to `initialize`.
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "method not found"}})
 
 
 # --- posting ----------------------------------------------------------------
@@ -2013,77 +2221,192 @@ def posted_finding(body: str) -> dict:
     return f
 
 
-def at_lead(also: dict, lead: dict) -> dict:
-    """Another check's note on a finding's lines (`merge_overlapping`),
-    marked with the lines of the finding it is posted under."""
-    return {**{k: lead[k] for k in ("path", "line_start", "line_end", "verified_by") if k in lead}, **also}
-
-
 def body_line(f: dict, where: str) -> str:
-    """A finding as a review-body bullet, other checks' notes nested under it."""
+    """A finding as a review-body bullet."""
     line = f"- `{where}` — **{f['severity']}** · `{f['check']}`: {f['summary']}"
     if f.get("raised_as"):
         line += f"\n  - Raised as {f['raised_as']}, verified as {f['severity']}: {lowered_why(f)}"
-    return line + "".join(f"\n  - **{a['severity']}** · `{a['check']}`: {a['summary']}" for a in f.get("also", []))
+    return line
+
+
+@dataclass
+class Lane:
+    """Who posts, and on what: the pull request, the commits the review
+    compared and the two models. Every review a lane posts opens with its
+    `lane` marker, which is how `is_lane_review` knows it."""
+    repo: str
+    pr: int
+    name: str
+    head_sha: str
+    base_sha: str
+    model: str
+    verify_model: str
+
+    @property
+    def meta(self) -> dict:
+        return {"lane": self.name, "commit": self.head_sha, "model": self.model, "verify_model": self.verify_model}
+
+    @property
+    def api(self) -> str:
+        return f"/repos/{self.repo}/pulls/{self.pr}"
+
+    def marker(self) -> str:
+        return marker("lane", name=self.name, commit=self.head_sha, model=self.model, verify_model=self.verify_model)
+
+
+def diff_lines(lane: Lane, token: str) -> dict[str, dict[int, int]]:
+    """The lines the review saw, per file: the pull request at `head_sha`
+    against its base, as the review job diffed it, not the live pull
+    request, which a push since may have moved."""
+    files = compare_files(lane.repo, lane.base_sha, lane.head_sha, token)
+    return {f["filename"]: commentable_lines(f.get("patch") or "") for f in files}
+
+
+def thread_for(f: dict, open_on: list[dict]) -> dict | None:
+    """The open lane thread on a finding's lines, if any: a finding there is
+    posted as a reply in it -- one conversation per problem, not one per
+    model and push."""
+    return next((
+        t for t in open_on
+        if t["path"] == f["path"] and (t.get("startLine") or t["line"]) <= f["line_end"] and f["line_start"] <= t["line"]
+    ), None)
+
+
+def inline_comment(f: dict, lines: dict[int, int], meta: dict) -> dict:
+    """A finding as a review comment on its last line, spanning its lines
+    when both ends sit in the same hunk (GitHub takes nothing else)."""
+    comment = {"path": f["path"], "line": f["line_end"], "side": "RIGHT", "body": comment_body(f, meta, AGENT_NOTE)}
+    if f["line_start"] < f["line_end"] and lines.get(f["line_start"]) == lines[f["line_end"]]:
+        comment.update(start_line=f["line_start"], start_side="RIGHT")
+    return comment
+
+
+def post_one(f: dict, lane: Lane, lines: dict[str, dict[int, int]], token: str) -> tuple[bool, str]:
+    """Post one confirmed finding as soon as it is confirmed: a reply in the
+    open lane thread on its lines, or else a review of its own holding just
+    its comment. Whether it was posted, and its URL or why not."""
+    file_lines = lines.get(f["path"], {})
+    if f["line_end"] not in file_lines:
+        return False, (f"line {f['line_end']} of {f['path']} is not a line of this pull request's diff "
+                       "that GitHub takes comments on")
+    if target := thread_for(f, open_threads(lane.repo, lane.pr, token)):
+        code, data = github("POST", f"{lane.api}/comments/{target['all'][0]['databaseId']}/replies", token,
+                            {"body": comment_body(f, lane.meta)})
+        if code in (200, 201) and isinstance(data, dict):
+            return True, data.get("html_url") or ""
+        return False, f"GitHub refused the reply in the open thread at {target['path']}:{target['line']} (HTTP {code})"
+    review = {"commit_id": lane.head_sha, "event": "COMMENT", "body": lane.marker(),
+              "comments": [inline_comment(f, file_lines, lane.meta)]}
+    code, data = github("POST", f"{lane.api}/reviews", token, review)
+    if code in (200, 201) and isinstance(data, dict):
+        return True, data.get("html_url") or ""
+    return False, f"GitHub refused the comment (HTTP {code}): {clip(str(data), 300)}"
+
+
+def post_batch(findings: list[dict], lane: Lane, lines: dict[str, dict[int, int]], token: str,
+               dry_run: bool = False) -> dict:
+    """Post, as one review, the confirmed findings the poster never got
+    (it was not running: a local run, or it could not be reached). A
+    finding on lines with an open lane thread goes there as a reply; one
+    GitHub takes no comment on goes in the review's body. What was posted:
+    `inline`, `merged` (replies), `loose`, `review_url`, `error`."""
+    open_on = open_threads(lane.repo, lane.pr, token) if findings else []
+    merged: list[tuple[dict, dict]] = []
+    comments, loose, inline = [], [], []
+    for f in findings:
+        file_lines = lines.get(f["path"], {})
+        if f["line_end"] not in file_lines:
+            loose.append(f)
+        elif target := thread_for(f, open_on):
+            merged.append((f, target))
+        else:
+            comments.append(inline_comment(f, file_lines, lane.meta))
+            inline.append(f)
+    body = [lane.marker()]
+    if loose:
+        body.append("Outside the diff's changed lines:\n")
+        body += [body_line(f, f"{f['path']}:{f['line_start']}") for f in loose]
+    closing = ["", footer(lane.meta)] if loose else []
+    review = {"commit_id": lane.head_sha, "event": "COMMENT", "body": "\n".join([*body, *closing]), "comments": comments}
+    done = {"inline": len(inline), "merged": 0, "loose": len(loose), "review_url": None, "error": None}
+    if dry_run:
+        into_open = [{"reply_to_thread": t["id"], "at": f"{t['path']}:{t['line']}", "body": comment_body(f, lane.meta)}
+                     for f, t in merged]
+        print(json.dumps({**review, "open_thread_replies": into_open}, indent=2))
+        return {**done, "merged": len(merged)}
+    for f, t in merged:
+        code, reply = github("POST", f"{lane.api}/comments/{t['all'][0]['databaseId']}/replies", token,
+                             {"body": comment_body(f, lane.meta)})
+        if code in (200, 201):
+            done["merged"] += 1
+        else:
+            print(f"::warning::reply in the open thread at {t['path']}:{t['line']} failed: {code} {reply}", file=sys.stderr)
+    if not comments and not loose:
+        return done
+    code, data = github("POST", f"{lane.api}/reviews", token, review)
+    if code == 422 and comments:
+        # A line GitHub will not anchor to: post everything in the body instead.
+        print(f"::warning::inline review rejected ({data}); posting findings in the review body", file=sys.stderr)
+        # Above the footer, as in any other review: the signature closes it.
+        review["body"] = "\n".join([*body, "", *(body_line(f, f"{f['path']}:{f['line_end']}") for f in inline), "",
+                                    footer(lane.meta)])
+        review["comments"] = []
+        done.update(inline=0, loose=len(loose) + len(inline))
+        code, data = github("POST", f"{lane.api}/reviews", token, review)
+    if code not in (200, 201):
+        # The findings are in no other request: a PR comment carries them
+        # rather than losing them (a body too large for a review, a 500),
+        # and the failure is still reported as one.
+        text = "\n".join([
+            lane.marker(), f"The review could not be posted (HTTP {code}); its findings:\n",
+            *(body_line(f, f"{f['path']}:{f['line_end']}") for f in [*inline, *loose]), "", footer(lane.meta),
+        ])
+        posted, _ = github("POST", f"/repos/{lane.repo}/issues/{lane.pr}/comments", token, {"body": clip(text, 65_000)})
+        kept = "; its findings are in a PR comment" if posted in (200, 201) else ""
+        return {**done, "error": f"posting the review failed: HTTP {code}{kept}"}
+    return {**done, "review_url": data.get("html_url")}
+
+
+def live_findings(lane: Lane, token: str) -> list[tuple[dict, dict]]:
+    """What this lane posted on the pull request for `head_sha`, read back
+    from GitHub rather than from the review job's word: each finding, and
+    the comment that carries it."""
+    found = []
+    for c in paged(f"{lane.api}/comments", token):
+        if (c.get("user") or {}).get("type") != "Bot":
+            continue
+        for m in markers(c.get("body") or "", "finding"):
+            if m.get("lane") == lane.name and m.get("commit") == lane.head_sha:
+                f = posted_finding(c["body"])
+                if "severity" in f:
+                    found.append((f, c))
+                break
+    return found
 
 
 def cmd_post(args: argparse.Namespace) -> None:
-    # No verified findings at all: the review job failed before writing them.
-    missing = not Path(args.input).exists()
-    findings = [] if missing else read_findings(args.input)
+    """Finish a lane: post what the review confirmed but the poster never
+    got (`pending.jsonl`), count what the lane posted, and write its result
+    for the summary."""
     status = read_status(args.status)
-    unverified = Path(args.input).with_name("findings.jsonl")
-    if missing and unverified.exists():
-        # The review ran and wrote its findings; verification failed before
-        # writing its own. Its findings are withheld as unconfirmed, not
-        # reported as a review that never ran.
-        missing = False
-        status["withheld"] = len(read_findings(str(unverified)))
+    # The review writes its status when it ends; without it the review job
+    # failed first (what it posted live is still counted).
+    missing = not status.get("error") and "checks_run" not in status
+    pending = read_findings(args.input) if Path(args.input).exists() else []
     token = os.environ.get("GH_TOKEN", "")
     if not token:
         # Even a dry run: without the reviewed diff every finding would
         # preview as outside it.
         raise SystemExit("GH_TOKEN is not set")
-    base = f"/repos/{args.repo}/pulls/{args.pr}"
     # The models that actually verified (a backup, when the verifier's
     # provider was down); each comment names its own (`verified_by`).
     verified_by = ", ".join(status.get("verified_by") or []) or args.verify_model
-    meta = {"lane": args.lane, "commit": args.head_sha, "model": args.model, "verify_model": verified_by}
-
-    # The lines the review saw: the pull request at `head_sha` against its
-    # base, as the review job diffed it, not the live pull request, which a
-    # push since may have moved. The review is anchored to `head_sha` too.
-    files = compare_files(args.repo, args.base_sha, args.head_sha, token)
-    diff_lines = {f["filename"]: commentable_lines(f.get("patch") or "") for f in files}
-
-    # Other checks' notes on the same lines are posted as replies in the
-    # lead comment's thread once the review exists; `threads` pairs each
-    # inline comment with them.
-    # A finding on lines where a lane thread is still open (this lane's from
-    # an earlier commit, or another lane's) is posted as a reply in that
-    # thread: one conversation per problem, not one per model and push.
-    open_on = open_threads(args.repo, args.pr, token)
-    merged: list[tuple[dict, dict]] = []
-    comments, loose, threads, inline = [], [], [], []
-    for f in findings:
-        lines = diff_lines.get(f["path"], {})
-        end, start = f["line_end"], f["line_start"]
-        if end not in lines:
-            loose.append(f)
-            continue
-        target = next((
-            t for t in open_on
-            if t["path"] == f["path"] and (t.get("startLine") or t["line"]) <= end and start <= t["line"]
-        ), None)
-        if target:
-            merged.append((f, target))
-            continue
-        comment = {"path": f["path"], "line": end, "side": "RIGHT", "body": comment_body(f, meta, AGENT_NOTE)}
-        if start < end and lines.get(start) == lines[end]:
-            comment.update(start_line=start, start_side="RIGHT")
-        comments.append(comment)
-        threads.append(f.get("also", []))
-        inline.append(f)
+    lane = Lane(args.repo, args.pr, args.lane, args.head_sha, args.base_sha, args.model, verified_by)
+    live = live_findings(lane, token)
+    done = post_batch(pending, lane, diff_lines(lane, token), token, args.dry_run) if pending else \
+        {"inline": 0, "merged": 0, "loose": 0, "review_url": None, "error": None}
+    findings = [f for f, _ in live] + ([] if done["error"] else pending)
+    replies = sum(1 for _, c in live if c.get("in_reply_to_id")) + done["merged"]
 
     ran, failed = status.get("checks_run"), status.get("checks_failed") or []
     counts = {s: sum(f["severity"] == s for f in findings) for s in SEVERITIES}
@@ -2093,12 +2416,11 @@ def cmd_post(args: argparse.Namespace) -> None:
         # not answer, a secret was missing).
         headline = f"the review did not run: {status['error']}"
     elif missing:
-        headline = "the review did not run: its job failed (see the workflow log)"
+        headline = "the review did not finish: its job failed (see the workflow log)" + (
+            f"; {tally} posted before it did" if findings else "")
     elif ran == [] and status.get("checks_skipped"):
         headline = "no check covers the files this pull request changes"
     elif ran and len(failed) == len(ran) and not findings:
-        # A check counts as failed when any of its diff's batches did; with
-        # findings from its other batches, it did run.
         headline = "the review did not run: no check finished (see the workflow log)"
     elif findings:
         headline = f"{tally}, each confirmed by a second model"
@@ -2108,132 +2430,161 @@ def cmd_post(args: argparse.Namespace) -> None:
         headline = "no confirmed findings: verification did not finish"
     else:
         headline = tally
-    # The review's body holds only findings that cannot sit on the code: how
-    # the lane went (headline, checks not covered, findings withheld) is
-    # the summary comment's. The lane marker is an HTML comment, so a review
-    # with every finding inline shows no body at all.
-    body = [marker("lane", name=args.lane, commit=args.head_sha, model=args.model, verify_model=verified_by)]
-    if loose:
-        body.append("Outside the diff's changed lines:\n")
-        body += [body_line(f, f"{f['path']}:{f['line_start']}") for f in loose]
-    closing = ["", footer(meta)] if loose else []
-    review = {"commit_id": args.head_sha, "event": "COMMENT", "body": "\n".join([*body, *closing]), "comments": comments}
-    # A lane posts a review only to show findings on the code. How every
-    # lane went -- clean, not covered, withheld, did not run -- is reported
-    # once, in the run's summary comment (`summary`), from the result file
-    # written here; a failure is never silent, and a PR does not collect a
-    # status review per lane per push.
-    noteworthy = bool(findings)
+    first = next((c.get("html_url") for _, c in live if not c.get("in_reply_to_id")), None)
     result = {
         "lane": args.lane, "model": args.model, "verify_model": verified_by,
-        "headline": headline, "counts": counts, "loose": len(loose), "merged": len(merged),
-        "repeated": status.get("repeated") or 0,
-        "unevidenced": status.get("unevidenced") or 0, "downgraded": status.get("downgraded") or 0,
+        "headline": headline, "counts": counts, "loose": done["loose"], "merged": replies,
+        "repeated": status.get("repeated") or 0, "unevidenced": status.get("unevidenced") or 0,
+        "downgraded": sum(1 for f in findings if f.get("raised_as")),
         "checks_run": ran or [], "checks_failed": failed, "checks_skipped": status.get("checks_skipped") or [],
         "checks_unstarted": status.get("checks_unstarted") or {},
         "rejected": status.get("rejected") or 0, "withheld": status.get("withheld") or 0,
-        "did_not_run": bool(missing or status.get("error")), "review_url": None, "post_error": None,
-        # Before verification (after merging overlaps): what the lane's own
-        # model raised, whatever the verifier then made of it.
-        "found": len(read_findings(str(unverified))) if unverified.exists() else None,
+        "duplicates": status.get("duplicates") or 0,
+        "did_not_run": bool(status.get("error") or (missing and not findings)),
+        "review_url": first or done["review_url"] or f"https://github.com/{args.repo}/pull/{args.pr}/files",
+        "post_error": done["error"],
+        # What the lane's own model raised, whatever the verifier then made of it.
+        "found": status.get("found"),
     }
-
-    def save(**fields: object) -> None:
-        result.update(fields)
-        if args.result:
-            Path(args.result).parent.mkdir(parents=True, exist_ok=True)
-            Path(args.result).write_text(json.dumps(result, indent=2), encoding="utf-8")
-
-    summary = f"### Goose review ({args.lane}, `{args.model}`)\n\n{headline}.\n"
+    if args.result:
+        Path(args.result).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.result).write_text(json.dumps(result, indent=2), encoding="utf-8")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
-            out.write(summary + ("" if noteworthy else "\nNo review posted; see the summary comment.\n"))
-    save()
-
+            out.write(f"### Goose review ({args.lane}, `{args.model}`)\n\n{headline}.\n")
     if args.dry_run:
-        if not noteworthy:
-            print(f"nothing to post: {headline}")
-            return
-        planned = [
-            {"reply_to": f"{c['path']}:{c['line']}", "body": comment_body(at_lead(a, f), meta)}
-            for c, f, also in zip(comments, inline, threads)
-            for a in also
-        ]
-        into_open = [
-            {"reply_to_thread": t["id"], "at": f"{t['path']}:{t['line']}", "body": comment_body(f, meta)}
-            for f, t in merged
-        ]
-        print(json.dumps({**review, "thread_replies": planned, "open_thread_replies": into_open}, indent=2))
+        print(f"{len(live)} finding(s) posted live; {headline}")
         return
-    if not token:
-        raise SystemExit("GH_TOKEN is not set")
-
-    if not noteworthy:
-        collapsed = collapse_resolved(args.repo, args.pr, token)
-        print(f"nothing to post ({headline}); {collapsed} resolved item(s) collapsed")
-        return
-
-    # Into the open threads first: they need no new review.
-    merged_ok = 0
-    for f, t in merged:
-        for note in [f, *(at_lead(a, f) for a in f.get("also", []))]:
-            code, reply = github("POST", f"{base}/comments/{t['all'][0]['databaseId']}/replies", token, {"body": comment_body(note, meta)})
-            if code in (200, 201):
-                merged_ok += 1
-            else:
-                print(f"::warning::reply in the open thread at {t['path']}:{t['line']} failed: {code} {reply}", file=sys.stderr)
-    if not comments and not loose:
-        save()
-        collapsed = collapse_resolved(args.repo, args.pr, token)
-        print(f"every finding went to an open thread ({merged_ok} repl(ies)); no review posted; {collapsed} resolved item(s) collapsed")
-        return
-
-    # Every finding the review carries, for a PR comment should the review
-    # itself not post (see below).
-    everything = [*inline, *loose]
-    status, data = github("POST", f"{base}/reviews", token, review)
-    if status == 422 and comments:
-        # A line GitHub will not anchor to: post everything in the body instead.
-        print(f"::warning::inline review rejected ({data}); posting findings in the review body", file=sys.stderr)
-        anchored = inline
-        # Above the footer, as in any other review: the signature closes it.
-        review["body"] = "\n".join([*body, "", *(body_line(f, f"{f['path']}:{f['line_end']}") for f in anchored), "", footer(meta)])
-        review["comments"] = []
-        comments, threads, inline = [], [], []
-        status, data = github("POST", f"{base}/reviews", token, review)
-    if status not in (200, 201):
-        # The findings are in no other request: a PR comment carries them
-        # rather than losing them (a body too large for a review, a 500),
-        # and the failure is still reported as one.
-        text = "\n".join([
-            marker("lane", name=args.lane, commit=args.head_sha, model=args.model, verify_model=verified_by),
-            f"The review could not be posted (HTTP {status}); its findings:\n",
-            *(body_line(f, f"{f['path']}:{f['line_end']}") for f in everything), "", footer(meta),
-        ])
-        code, _ = github("POST", f"/repos/{args.repo}/issues/{args.pr}/comments", token, {"body": clip(text, 65_000)})
-        kept = "; its findings are in a PR comment" if code in (200, 201) else ""
-        save(post_error=f"posting the review failed: HTTP {status}{kept}")
-        raise SystemExit(f"posting the review failed: {status} {data}")
-    save(review_url=data.get("html_url"))
-
-    replies = 0
-    if any(threads):
-        posted = paged(f"{base}/reviews/{data['id']}/comments", token)
-        by_place = {(c["path"], c.get("line") or c.get("original_line")): c["id"] for c in posted}
-        for comment, f, also in zip(comments, inline, threads):
-            parent = by_place.get((comment["path"], comment["line"]))
-            for a in also if parent else []:
-                reply_status, reply = github("POST", f"{base}/comments/{parent}/replies", token, {"body": comment_body(at_lead(a, f), meta)})
-                if reply_status in (200, 201):
-                    replies += 1
-                else:
-                    print(f"::warning::reply to {comment['path']}:{comment['line']} failed: {reply_status} {reply}", file=sys.stderr)
-    # Threads resolved while this run reviewed, of any lane or commit.
     collapsed = collapse_resolved(args.repo, args.pr, token)
-    print(
-        f"posted review with {len(comments)} inline comment(s) and {replies} thread repl(ies), "
-        f"{len(loose)} in the body, {merged_ok} repl(ies) in open threads, {collapsed} resolved item(s) collapsed"
-    )
+    print(f"{len(live)} finding(s) posted live, {len(pending)} at the end ({done['inline']} inline, "
+          f"{done['merged']} into open threads, {done['loose']} in the body); {collapsed} resolved item(s) collapsed")
+    if done["error"]:
+        raise SystemExit(done["error"])
+
+
+# --- the poster: posts each finding as it is confirmed -----------------------
+
+# A lane posts at most this many comments live: past it, a review is
+# more likely looping than finding.
+MAX_LIVE_COMMENTS = 20
+# The longest text the poster takes for each field, in characters.
+LIVE_LIMITS = {"path": 500, "check": 100, "summary": 4000, "trigger": 1000, "severity_reason": 1000, "raised_as": 20}
+
+
+def live_finding(raw: object, verifiers: set[str]) -> tuple[dict | None, str]:
+    """A confirmed finding sent to the poster, checked field by field (the
+    model's shell can write to the socket too); or None and why not."""
+    if not isinstance(raw, dict):
+        return None, "not a finding"
+    f = normalise(raw, raw.get("check") if isinstance(raw.get("check"), str) else "")
+    if f is None or not f["check"]:
+        return None, "a finding needs `severity`, `path`, `line_start`, `summary` and `check`"
+    if raw.get("severity") not in SEVERITIES:
+        return None, "`severity` must be one of " + ", ".join(SEVERITIES)
+    evidence = raw.get("evidence")
+    if not isinstance(raw.get("trigger"), str) or not raw["trigger"].strip() or not isinstance(evidence, dict) \
+            or not isinstance(evidence.get("path"), str) or not isinstance(evidence.get("line"), int):
+        return None, "a confirmed finding carries the verifier's `trigger` and `evidence`"
+    if raw.get("verified_by") not in verifiers:
+        return None, "`verified_by` is not one of this lane's verifiers"
+    f.update(trigger=raw["trigger"].strip(), evidence={"path": evidence["path"], "line": evidence["line"]},
+             verified_by=raw["verified_by"])
+    if raw.get("raised_as") in SEVERITIES and SEVERITIES.index(raw["raised_as"]) > SEVERITIES.index(f["severity"]):
+        f["raised_as"] = raw["raised_as"]
+        f["severity_reason"] = str(raw.get("severity_reason") or "")
+    for key, limit in LIVE_LIMITS.items():
+        if len(str(f.get(key, ""))) > limit:
+            return None, f"`{key}` is longer than {limit} characters"
+    return f, ""
+
+
+def scrubbed(f: dict) -> dict:
+    """Every text of a finding, scrubbed of the provider secrets."""
+    return {k: scrubbed(v) if isinstance(v, dict) else redact(v) if isinstance(v, str) else v for k, v in f.items()}
+
+
+def cmd_poster(args: argparse.Namespace) -> None:
+    """Post a lane's findings as they are confirmed, from a process the
+    model cannot reach: started as a user of its own before the review
+    job drops sudo, with the GitHub token and the provider secrets (to
+    scrub with) read from stdin as JSON -- `{"token", "routes", "env",
+    "secrets"}` -- so they are in no environment, file or command line.
+    It listens on a unix socket: one JSON line in, `{"finding": {...}}`,
+    one out, `{"ok": true, "url": ...}` or `{"ok": false, "reason": ...}`.
+    It checks every request itself: anything on the machine can write to
+    the socket, the model's shell included."""
+    import socket
+
+    given = json.loads(sys.stdin.readline())
+    token = given["token"]
+    os.environ.update(GOOSE_REVIEW_PROVIDER_ROUTES=given.get("routes") or "",
+                      GOOSE_REVIEW_PROVIDER_ENV=given.get("env") or "", GOOSE_REVIEW_SECRETS=given.get("secrets") or "")
+    proxy_secrets()  # a malformed setting stops the poster now, not at its first finding
+    lane = Lane(args.repo, args.pr, args.lane, args.head_sha, args.base_sha, args.model, ", ".join(args.verifier))
+    lines = diff_lines(lane, token)
+    verifiers = set(args.verifier)
+    lock = threading.Lock()
+    posted = 0
+
+    def handle(request: object) -> dict:
+        nonlocal posted
+        f, why = live_finding(request.get("finding") if isinstance(request, dict) else None, verifiers)
+        if f is None:
+            return {"ok": False, "reason": why}
+        f = scrubbed(f)
+        with lock:
+            if posted >= MAX_LIVE_COMMENTS:
+                ok, detail = False, f"this lane has posted its {MAX_LIVE_COMMENTS} comments"
+            else:
+                ok, detail = post_one(f, lane, lines, token)
+                posted += ok
+        if args.log:
+            with open(args.log, "a", encoding="utf-8") as out:
+                out.write(json.dumps({"finding": f, "ok": ok, "detail": detail}) + "\n")
+        print(f"{'posted' if ok else 'refused'}: {f['path']}:{f['line_end']} {detail}", file=sys.stderr, flush=True)
+        return {"ok": True, "url": detail} if ok else {"ok": False, "reason": detail}
+
+    def serve(connection: socket.socket) -> None:
+        with connection, connection.makefile("rw", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    answer = handle(json.loads(line))
+                except ValueError:
+                    answer = {"ok": False, "reason": "not JSON"}
+                except Exception as error:  # one bad request does not stop the poster
+                    answer = {"ok": False, "reason": f"the poster failed: {type(error).__name__}"}
+                stream.write(json.dumps(answer) + "\n")
+                stream.flush()
+
+    Path(args.socket).unlink(missing_ok=True)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(args.socket)
+        os.chmod(args.socket, 0o666)
+        server.listen()
+        server.settimeout(args.idle_minutes * 60)
+        print(f"poster: listening on {args.socket} for lane {lane.name}", file=sys.stderr, flush=True)
+        while True:
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                print("poster: idle, stopping", file=sys.stderr)
+                return
+            connection.settimeout(None)
+            threading.Thread(target=serve, args=(connection,), daemon=True).start()
+
+
+def send_to_poster(path: str, finding: dict, timeout: float = 120) -> dict:
+    """One finding to the poster; its answer."""
+    import socket
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect(path)
+        with connection.makefile("rw", encoding="utf-8") as stream:
+            stream.write(json.dumps({"finding": finding}) + "\n")
+            stream.flush()
+            answer = json.loads(stream.readline())
+    return answer if isinstance(answer, dict) else {"ok": False, "reason": "the poster gave no answer"}
 
 
 SUMMARY_MARKER = "<!-- goose-review:summary -->"
@@ -2432,7 +2783,7 @@ def review_commit(comment: dict) -> str:
 
 
 def answered_finding(body: str) -> dict:
-    """A lane comment as `verify` is given it: `posted_finding`, its text cut
+    """A lane comment as the verifier is given it: `posted_finding`, its text cut
     to ANSWER_CHARS."""
     f = posted_finding(body)
     return {**f, **{k: f[k][:ANSWER_CHARS] for k in ("summary", "trigger") if k in f}}
@@ -2440,7 +2791,7 @@ def answered_finding(body: str) -> dict:
 
 def cmd_answered(args: argparse.Namespace) -> None:
     """Every lane finding on the pull request that someone answered (a
-    reply that is not the review's own), newest first, for `verify`: a
+    reply that is not the review's own), newest first, for the verifier: a
     finding already answered is not raised again unless the code the
     answer relied on changed."""
     token = os.environ.get("GH_TOKEN", "")
@@ -2663,10 +3014,11 @@ def lane_row(lane: str, r: dict | None, j: dict[str, dict]) -> dict:
     tally = ", ".join(f"{n} {s}" for s, n in reversed(r["counts"].items()) if n)
     posted = f"[{tally}]({r['review_url']})" if tally and r.get("review_url") else tally or "0"
     repeated, unevidenced = r.get("repeated") or 0, r.get("unevidenced") or 0
-    # Repeats and findings kept without evidence are rejected ones too:
-    # "3 rejected, of which 1 already answered", never read as 3 + 1.
+    # Repeats and findings kept without evidence are denied ones too:
+    # "3 denied, of which 1 already answered", never read as 3 + 1.
     why = [f"{repeated} already answered"] * bool(repeated) + [f"{unevidenced} without evidence"] * bool(unevidenced)
-    extra = [f"{r['rejected']} rejected" + (f", of which {' and '.join(why)}" if why else "")] if r["rejected"] else []
+    extra = [f"{r['rejected']} denied" + (f", of which {' and '.join(why)}" if why else "")] if r["rejected"] else []
+    extra += [f"{r['duplicates']} duplicates"] if r.get("duplicates") else []
     extra += [f"{r['downgraded']} downgraded"] if r.get("downgraded") else []
     extra += [f"{r['merged']} into open threads"] if r.get("merged") else []
     extra += [f"{r['withheld']} withheld"] if r["withheld"] else []
@@ -2750,39 +3102,51 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    review = sub.add_parser("review", help="run the checks and write findings.jsonl")
+    review = sub.add_parser("review", help="run the checks, each finding verified and posted as it is found")
     review.add_argument("--base", required=True, help="base ref, e.g. origin/main")
     review.add_argument("--provider", required=True)
     review.add_argument("--model", required=True)
+    review.add_argument("--verify-provider", required=True, help="the verifying model's provider")
+    review.add_argument("--verify-model", required=True, help="the verifying model; use another family than --model's")
+    review.add_argument("--backup-provider", default="", help="verifies instead when the verifier's provider is down")
+    review.add_argument("--backup-model", default="")
     review.add_argument("--context", help="file with the pull request title and description")
-    review.add_argument("--jobs", type=int, default=3, help="checks run at once")
-    review.add_argument("--budget-minutes", type=float, default=35, help="wall-clock budget for all checks")
-    review.add_argument("--out", default="findings.jsonl")
+    review.add_argument("--answered", help="answered findings from `answered`, so they are not raised again")
+    review.add_argument("--jobs", type=int, default=2, help="checks run at once")
+    review.add_argument("--budget-minutes", type=float, default=45, help="wall-clock budget for all checks")
+    review.add_argument("--poster-socket", default=os.environ.get("GOOSE_REVIEW_POSTER_SOCKET", ""),
+                        help="the poster's socket (`poster`): confirmed findings are posted as they are confirmed; "
+                             "without it they go to --out, for `post`")
+    review.add_argument("--out", default="pending.jsonl", help="confirmed findings not posted yet")
+    review.add_argument("--calls", help="every post_comment call and its outcome (default: calls.jsonl next to --out)")
     review.add_argument("--status", default="review-status.json")
     review.set_defaults(func=cmd_review)
 
-    verify = sub.add_parser("verify", help="keep only findings a second model confirms")
-    verify.add_argument("--base", required=True)
-    verify.add_argument("--provider", required=True)
-    verify.add_argument("--model", required=True)
-    verify.add_argument("--backup-provider", default="", help="verifies instead when --model's provider is down")
-    verify.add_argument("--backup-model", default="")
-    verify.add_argument("--context")
-    verify.add_argument("--answered", help="answered findings from `answered`, so they are not raised again")
-    verify.add_argument("--jobs", type=int, default=2, help="verification batches run at once")
-    verify.add_argument("--budget-minutes", type=float, default=12, help="wall-clock budget for verification")
-    verify.add_argument("--in", dest="input", default="findings.jsonl")
-    verify.add_argument("--out", default="verified.jsonl")
-    verify.add_argument("--status", default="review-status.json")
-    for p in (review, verify):
-        p.add_argument("--checks-dir", default=".agents/checks", help="directory of the check files")
-        p.add_argument("--check", action="append", help="run only this check (by name); repeatable")
-        p.add_argument("--facts-dir", default=".agents/facts", help="directory of the facts files; missing means none")
-        p.add_argument("--ignore", action="append", help="glob never reviewed; repeatable, and the same for review and verify")
-        p.add_argument("--tools-file", help="appended to the tools prompt: the project's own commands")
-        p.add_argument("--tools", help="the caller's installed tools (YAML or JSON), announced in the tools prompt")
-        p.add_argument("--rules-file", help="replaces the rules added to every check's and the verifier's prompt")
-    verify.set_defaults(func=cmd_verify)
+    mcp = sub.add_parser("mcp", help="the post_comment tool, as a stdio MCP server for one check's Goose run")
+    mcp.add_argument("--spec", required=True, help="the run's settings, written by `review`")
+    mcp.set_defaults(func=cmd_mcp)
+
+    poster = sub.add_parser("poster", help="post a lane's findings as they are confirmed (secrets as JSON on stdin)")
+    poster.add_argument("--socket", required=True)
+    poster.add_argument("--repo", required=True, help="owner/name")
+    poster.add_argument("--pr", required=True, type=int)
+    poster.add_argument("--head-sha", required=True)
+    poster.add_argument("--base-sha", required=True, help="the base the review diffs against")
+    poster.add_argument("--lane", required=True)
+    poster.add_argument("--model", required=True, help="the reviewing model")
+    poster.add_argument("--verifier", action="append", required=True,
+                        help="a model that may confirm findings (the verifier and its backup); repeatable")
+    poster.add_argument("--log", help="append each finding and what became of it here")
+    poster.add_argument("--idle-minutes", type=float, default=120, help="stop after this long without a request")
+    poster.set_defaults(func=cmd_poster)
+
+    review.add_argument("--checks-dir", default=".agents/checks", help="directory of the check files")
+    review.add_argument("--check", action="append", help="run only this check (by name); repeatable")
+    review.add_argument("--facts-dir", default=".agents/facts", help="directory of the facts files; missing means none")
+    review.add_argument("--ignore", action="append", help="glob never reviewed; repeatable")
+    review.add_argument("--tools-file", help="appended to the tools prompt: the project's own commands")
+    review.add_argument("--tools", help="the caller's installed tools (YAML or JSON), announced in the tools prompt")
+    review.add_argument("--rules-file", help="replaces the rules added to every check's and the verifier's prompt")
 
     lanes = sub.add_parser("lanes", help="read, check and normalise the lanes in $GOOSE_REVIEW_LANES (YAML or JSON)")
     lanes.add_argument("--checks-dir", default=".agents/checks", help="to check each lane's check names; skipped when missing")
@@ -2793,23 +3157,23 @@ def main() -> None:
     tools.add_argument("--install", help="download each tool, checked by its sha256, into this directory")
     tools.set_defaults(func=cmd_tools)
 
-    ans = sub.add_parser("answered", help="write the pull request's answered lane findings, for `verify`")
+    ans = sub.add_parser("answered", help="write the pull request's answered lane findings, for the verifier")
     ans.add_argument("--repo", required=True, help="owner/name")
     ans.add_argument("--pr", required=True, type=int)
     ans.add_argument("--out", required=True)
     ans.set_defaults(func=cmd_answered)
 
-    post = sub.add_parser("post", help="publish findings as a pull request review")
+    post = sub.add_parser("post", help="finish a lane: post what the poster did not, count what the lane posted")
     post.add_argument("--repo", required=True, help="owner/name")
     post.add_argument("--pr", required=True, type=int)
     post.add_argument("--head-sha", required=True)
     post.add_argument("--base-sha", required=True, help="the base the review diffed against")
     post.add_argument("--lane", required=True)
     post.add_argument("--model", required=True, help="the reviewing model")
-    post.add_argument("--verify-model", help="the model that confirmed the findings")
-    post.add_argument("--in", dest="input", default="verified.jsonl")
+    post.add_argument("--verify-model", help="the model that confirmed the findings, when the status names none")
+    post.add_argument("--in", dest="input", default="pending.jsonl", help="confirmed findings not posted yet")
     post.add_argument("--status", default="review-status.json")
-    post.add_argument("--dry-run", action="store_true", help="print the review instead of posting it")
+    post.add_argument("--dry-run", action="store_true", help="print what would be posted instead of posting it")
     post.add_argument("--result", help="write the lane's result here, for `summary`")
     post.set_defaults(func=cmd_post)
 

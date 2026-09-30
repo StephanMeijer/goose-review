@@ -81,7 +81,7 @@ Provider-specific preflights such as NotedThat's OpenRouter credit check (lane.y
 
 ### Tokens
 
-- `github-token` is used only by `answered`, `post`, `tidy` and `summary`, never in the review or verify steps. `GITHUB_TOKENS`, `ACTIONS_*` and `FILE_COMMANDS` stay stripped from the model's environment.
+- `github-token` is used only by `answered`, `post`, `tidy` and `summary`, never in the review or verify steps. (Since 0.4.0 the review job's token can write, and only the `poster` holds it; see the README.) `GITHUB_TOKENS`, `ACTIONS_*` and `FILE_COMMANDS` stay stripped from the model's environment.
 - `summary` needs `actions: read`, `issues: write` and `pull-requests: write`.
 
 The same-repo/draft/release gate and the concurrency group (`cancel-in-progress: false`) stay in the caller, and the example shows them.

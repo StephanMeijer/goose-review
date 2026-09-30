@@ -2,10 +2,11 @@
 
 An LLM review of your pull requests with [Goose](https://github.com/block/goose),
 where everything the review looks for is yours: your checks, your facts,
-your models. One model reviews, a model of another family verifies every
-finding against the code, and only confirmed findings are posted, as
-comments on the lines they are about. It is advisory: it never blocks a
-merge.
+your models. One model reviews and reports each finding as soon as it has
+established it; a model of another family verifies it against the code
+then and there, and a confirmed finding is posted right away, as a comment
+on the lines it is about. The reviewer hears back either way -- posted, or
+denied and why -- and carries on. It is advisory: it never blocks a merge.
 
 It was built for [NotedThat](https://github.com/NotedThat/NotedThat) (PR
 #207) and extracted to be used anywhere.
@@ -68,7 +69,9 @@ Inputs:
 - Directories: `checks-dir`, `facts-dir`, `providers-dir`.
 - Prompt and diff: `ignore`, `tools-file`, `rules-file`.
 - `tools`: linters, renderers and the like to install in the review job and announce to the model (see [Tools](#tools)).
-- Time budgets: `budget-minutes` (35) and `verify-budget-minutes` (12).
+- Time budget: `budget-minutes` (45), for a lane's checks and the
+  verification of what they report. (`verify-budget-minutes` is deprecated:
+  a value given is added to it.)
 - The review job: `egress-endpoints` (a JSON list of the hosts it may reach beyond GitHub; the allow-list splits on single spaces),
   `setup` (your preparation, e.g. `cargo fetch --locked`), `runs-on`,
   `review-timeout-minutes` (60).
@@ -79,13 +82,17 @@ Secrets:
 
 ### 2. The composite actions (your own wiring)
 
-`lanes`, `tools`, `tidy`, `review`, `post` and `summary` are what the workflow is made of (`lanes` turns YAML lanes into a matrix; optional when you write the matrix yourself; `tools` installs your tools in the review job, before your setup, and the `review` action takes the same list to announce them);
+`lanes`, `tools`, `tidy`, `poster`, `review`, `post` and `summary` are what the workflow is made of (`lanes` turns YAML lanes into a matrix; optional when you write the matrix yourself; `tools` installs your tools in the review job, before your setup, and the `review` action takes the same list to announce them);
 [`examples/hand-wired/`](examples/hand-wired/) wires them by hand.
 
 - `tidy` first: it collapses the review's own resolved threads and marks
   the run as running.
-- Then per lane, `review` in one job and `post` in another. Keep those job
-  names: the summary links each lane's row to them.
+- Then per lane, a `review` job and a `post` job. Keep those job names:
+  the summary links each lane's row to them. In the review job, `poster`
+  comes first -- before harden-runner, as it needs sudo -- and checks out
+  the pull request; give no step after it the token (harden-runner's
+  `token: ""`, and no `actions/checkout`). See
+  [Security model](#security-model).
 - `summary` last.
 
 Each action's inputs are documented in its `action.yml`.
@@ -148,32 +155,43 @@ Your `tools-file` hints come after them in the prompt.
 
 1. **tidy**: collapses the review's own resolved threads as outdated, and
    marks the run as running in the summary comment.
-2. **review**, per lane, in a job with a read-only token and its network
-   blocked (harden-runner) except for GitHub and your providers:
-   1. Install your `tools`, run your `setup`, then install Goose, plus
+2. **review**, per lane:
+   1. Start the poster (before anything else, see
+      [Security model](#security-model)) and check out the pull request.
+   2. Block the network (harden-runner) except for GitHub and your
+      providers, and remove sudo.
+   3. Install your `tools`, run your `setup`, then install Goose, plus
       ripgrep, fd and ast-grep (all pinned by sha256).
-   2. Install your provider templates and ask each provider for its models
+   4. Install your provider templates and ask each provider for its models
       (preflight).
-   3. Collect the PR text and the findings someone already answered on this
+   5. Collect the PR text and the findings someone already answered on this
       PR.
-   4. Run each matching check as its own `goose run` with a shell in the
-      checkout, within the time budget.
-   5. Have the verifier (or its backup) re-check every finding. It must
-      quote the line that shows the defect; a finding that repeats an
-      answered one is rejected, unless the code the answer relied on
-      changed.
-   6. Scrub the provider secrets from everything, and upload it.
+   6. Run each matching check as its own `goose run` with a shell in the
+      checkout, within the time budget. The model reports each finding
+      through the `post_comment` tool as soon as it has established it:
+      - a finding on a file or lines the pull request does not change, or
+        on lines already commented on, is denied at once;
+      - otherwise the verifier (or its backup) re-checks it against the
+        code. It must quote the line that shows the defect; a finding that
+        repeats an answered one is denied, unless the code the answer
+        relied on changed;
+      - a confirmed finding goes to the poster, which posts it on its
+        lines (a reply, when a lane thread is open there) as
+        `github-actions[bot]`, signed with the models.
+
+      The reviewer is told which it was, and why, and carries on.
+   7. Scrub the provider secrets from everything, and upload it.
 3. **post**, per lane, in a job that runs no model:
    1. Scrub again: once the model has had a shell in the review job,
       nothing later in that job is trusted.
-   2. Post one review with the findings on their lines, as
-      `github-actions[bot]` and signed with the models. A finding on lines
-      with an open thread goes into that thread as a reply.
+   2. Post what the review confirmed but the poster did not get (it did not
+      start, or could not be reached), as one review.
+   3. Count what the lane posted, read back from the pull request.
 4. **summary**: one comment, always the pull request's last item:
    - the latest run on top, per model: Verified by, Checks, Found (what the
-     model raised) and Posted (what a second model confirmed, with the
-     rejected, already-answered and withheld counts), Result, and links to
-     the jobs;
+     model reported) and Posted (what a second model confirmed, with the
+     denied, already-answered, duplicate and withheld counts), Result, and
+     links to the jobs;
    - every earlier run folded under "All runs";
    - per model, how its threads were answered.
 
@@ -204,7 +222,7 @@ The engine adds the rest of the prompt:
 - the rules ("Only failures that can happen", or your `rules-file`);
 - the matching facts;
 - the tools, with your `tools` and your `tools-file`;
-- the output format;
+- how to report: the `post_comment` tool;
 - the diff of the files the check covers.
 
 Facts use the same format. See [`examples/checks/`](examples/checks/) and
@@ -234,21 +252,40 @@ Two settings are load-bearing for OpenAI-compatible endpoints:
 
 ## Security model
 
-- **The review job:** the model runs there with a shell, a read-only
-  token, the network blocked except for what you list, and no sudo. Its
-  environment has no GitHub token, no Actions runtime token and no raw
-  provider settings, only the keys your templates name. The model's shell
-  can read those keys; keep them scoped and spending-capped.
+- **The review job:** the model runs there with a shell, the network
+  blocked except for what you list, and no sudo. Its environment has no
+  GitHub token, no Actions runtime token and no raw provider settings,
+  only the keys your templates name. The model's shell can read those
+  keys; keep them scoped and spending-capped.
+- **The poster** holds the job's token, which can write to the pull
+  request (`pull-requests: write`). It is started first, while sudo still
+  exists, as a user of its own (`goose-review-poster`), from a root-owned
+  copy of the engine, with the token and the provider settings on its
+  stdin: in no environment, command line or file. `ptrace_scope=2` keeps
+  every process out of another's memory. The model's shell -- the runner
+  user, without sudo -- can only write to the poster's socket, and the
+  poster checks every request itself: the lines must be ones GitHub takes
+  comments on in this pull request's diff, the fields well-formed and
+  bounded, the confirming model one of the lane's verifiers, at most 20
+  comments per lane; it scrubs the text (every route, its origin and host,
+  every key; verbatim, base64, hex, percent-encoded, reversed) and signs
+  it.
+- **The verifier is a quality gate, not a security boundary.** The model
+  can write to the socket itself and so post a finding no second model
+  confirmed -- checked, scrubbed, bounded and signed as above. It could
+  already rewrite the engine before verification ran.
 - **Once the model has run:** nothing later in the review job is trusted.
-  The model can rewrite files, and through the runner's file commands
-  influence later steps.
+  The model can rewrite files -- the actions later steps run included --
+  and through the runner's file commands influence later steps. So no step
+  after it is given the token: the poster checks out the pull request (a
+  fetch; actions/checkout's post step would get the token), and
+  harden-runner gets `token: ""`.
 - **The post job** runs on a fresh runner with this action's own copy of
-  the engine, not your checkout. It scrubs the findings again (every
-  route, its origin and host, every key; verbatim, base64, hex,
-  percent-encoded, reversed) before posting.
+  the engine, not your checkout. It scrubs again before posting what is
+  left, and counts what was posted from the pull request itself.
 - **What remains:**
-  - The review job's artifact (findings and transcripts, kept 14 days) is
-    only as clean as that job.
+  - The review job's artifact (the calls, pending findings and
+    transcripts, kept 14 days) is only as clean as that job.
   - A secret disguised some other way is not caught by any scrub.
 
   Run the review only on same-repository pull requests; the example gates
@@ -264,13 +301,15 @@ export GOOSE_REVIEW_PROVIDER_ENV='MY_PROXY_TOKEN=...'
 export GOOSE_REVIEW_PROVIDER_ROUTES='my_proxy=https://proxy.example/route'
 ./setup-providers.sh .github/goose/providers "${XDG_CONFIG_HOME:-$HOME/.config}/goose/custom_providers"
 
-python3 goose_review.py review --base origin/main --provider my_proxy --model deepseek-v4-flash
-python3 goose_review.py verify --base origin/main --provider my_proxy --model MiniMax-M3
+# Without a poster, confirmed findings go to pending.jsonl; every
+# post_comment call and its outcome to calls.jsonl
+python3 goose_review.py review --base origin/main --provider my_proxy --model deepseek-v4-flash \
+  --verify-provider my_proxy --verify-model MiniMax-M3
 
-# The review a lane would post, without posting it
+# What `post` would post, without posting it
 GH_TOKEN=$(gh auth token) python3 goose_review.py post --dry-run --repo owner/repo --pr 123 \
   --head-sha "$(git rev-parse HEAD)" --base-sha "$(git rev-parse origin/main)" \
-  --lane deepseek --model deepseek-v4-flash
+  --lane deepseek --model deepseek-v4-flash --verify-model MiniMax-M3
 ```
 
 Run these from your repository, calling this repository's `goose_review.py`.

@@ -21,10 +21,41 @@ jobs:
     continue-on-error: true
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     steps:
+      # This repository's own actions run from the checkout, so it comes
+      # first: a fetch, not actions/checkout, whose post step would get the
+      # token after the model has run.
+      - name: Check out the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git init -q .
+          git remote add origin "$SERVER/$REPO"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git -c "http.extraheader=AUTHORIZATION: basic $auth" fetch -q --no-tags origin "$HEAD_SHA" "$BASE_SHA"
+          git checkout -q --detach "$HEAD_SHA"
+
+      - uses: ./poster
+        with:
+          lane: ${{ inputs.lane }}
+          model: ${{ inputs.model }}
+          verify-model: ${{ inputs.verify-model }}
+          verify-backup-model: ${{ inputs.verify-backup-model }}
+          provider-routes: routed=http://127.0.0.1:8765/r1
+          provider-env: |
+            E2E_ROUTED_KEY=e2e-routed-key-0000
+            E2E_DIRECT_KEY=e2e-direct-key-0000
+          checkout: "false"
+
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
+          token: ""
           egress-policy: block
           disable-sudo-and-containers: true
           allowed-endpoints: >
@@ -54,11 +85,47 @@ jobs:
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          persist-credentials: false
+      # What the model's shell will be: the runner user without sudo. It
+      # must not reach the token: not through the poster's memory or
+      # environment, nor any process's environment it can read; and the
+      # poster must check what it is sent itself.
+      - name: Check the poster's isolation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFY_MODEL: ${{ inputs.verify-model }}
+        run: |
+          set -u
+          test "$(cat /proc/sys/kernel/yama/ptrace_scope)" = 2
+          if sudo -n true 2>/dev/null; then echo "::error::sudo is still there"; exit 1; fi
+          pid=$(pgrep -u goose-review-poster -f 'goose_review.py poster')
+          if cat "/proc/$pid/environ" >/dev/null 2>&1; then echo "::error::the poster's environment is readable"; exit 1; fi
+          if cat "/proc/$pid/mem" >/dev/null 2>&1; then echo "::error::the poster's memory is readable"; exit 1; fi
+          python3 - <<'EOF'
+          import os
+          token = os.environ["GH_TOKEN"].encode()
+          mine = {os.getpid(), os.getppid()}
+          for pid in filter(str.isdigit, os.listdir("/proc")):
+              if int(pid) in mine:
+                  continue
+              try:
+                  environ = open(f"/proc/{pid}/environ", "rb").read()
+              except OSError:
+                  continue
+              assert token not in environ, f"process {pid} has the token in its environment"
+          EOF
+          python3 - <<'EOF'
+          import os
+          import sys
+          sys.path.insert(0, ".")
+          import goose_review as g
+          answer = g.send_to_poster("/run/goose-review/poster.sock", {
+              "severity": "high", "path": "tests/e2e/fixture/planted.py", "line_start": 99999, "line_end": 99999,
+              "check": "planted", "summary": "Not a line of the diff.", "trigger": "t",
+              "evidence": {"path": "tests/e2e/fixture/planted.py", "line": 1},
+              "verified_by": os.environ["VERIFY_MODEL"]})
+          assert answer == {"ok": False, "reason": answer.get("reason")} and "not a line" in answer["reason"], answer
+          print("poster isolation ok:", answer["reason"])
+          EOF
 
       - name: Set up the fakes
         env:

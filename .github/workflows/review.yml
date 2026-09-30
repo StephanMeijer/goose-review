@@ -66,11 +66,13 @@ on:
         type: string
         default: ""
       budget-minutes:
+        description: A lane's wall-clock budget for its checks, the verification of each finding included.
         type: number
-        default: 35
+        default: 45
       verify-budget-minutes:
+        description: Deprecated; findings are verified during the review. A value given is added to budget-minutes.
         type: number
-        default: 12
+        default: 0
       egress-endpoints:
         description: >-
           JSON list of further host:port entries the review job may reach:

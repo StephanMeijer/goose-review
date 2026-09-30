@@ -2,6 +2,29 @@
 
 ## 0.4.0
 
+- **Breaking:** findings are posted as they are found. The reviewer reports
+  each finding through a `post_comment` tool as soon as it has established
+  it; a model of another family verifies it then and there, and a confirmed
+  finding is posted right away -- as a single-comment review, or a reply in
+  the lane thread open on its lines. The reviewer hears back either way,
+  posted or denied and why, and carries on. A finding on unchanged lines,
+  or on lines already commented on, is denied without a model.
+  - The review job's token can now write (`pull-requests: write`): only the
+    new `poster` action holds it -- a process of its own user, started
+    before harden-runner removes sudo, with the token in its memory only.
+    It checks, scrubs and signs every finding before posting it. See the
+    README's "Security model".
+  - Hand-wired callers: put `poster` first in the review job (it also
+    checks out the pull request), give harden-runner `token: ""`, drop
+    `actions/checkout` there, and grant the job `pull-requests: write`.
+  - The `verify` step and subcommand are gone: `review` takes
+    `--verify-provider`, `--verify-model` and the backup, and writes the
+    confirmed findings it could not post (`pending.jsonl`) and every call
+    (`calls.jsonl`). `post` posts what is left and counts what the lane
+    posted from the pull request.
+  - `budget-minutes` (now 45) covers verification too;
+    `verify-budget-minutes` is deprecated, and a value given is added to it.
+  - The summary's Posted column counts denied findings and duplicates.
 - `tools`: install your own tools in the review job and tell the model it
   may run them -- a linter, `helm`, `kubeconform`. Each is a download fixed
   by its sha256 (a binary, or one file out of an archive) with a `use` line

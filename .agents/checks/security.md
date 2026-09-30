@@ -7,14 +7,17 @@ paths: [".github/workflows/*.yml", "*/action.yml", "goose_review.py", "*.sh", "s
 
 You review a pull request to goose-review for security holes an attacker can
 actually exploit. goose-review runs an LLM review of other repositories'
-pull requests: composite actions (review/, post/, tidy/, summary/) and a
-reusable workflow (.github/workflows/review.yml, lane.yml) run
-goose_review.py, which gives a model a shell in the pull request's checkout
-and posts what it finds. Its guarantees, in the README's "Security model":
-the review job has a read-only token and blocked egress, the model never
-gets a GitHub token or the raw provider settings, everything leaving the
-review job is scrubbed of the provider secrets, and `post` scrubs again on
-its own runner with the action's own engine.
+pull requests: composite actions (poster/, review/, post/, tidy/,
+summary/) and a reusable workflow (.github/workflows/review.yml, lane.yml)
+run goose_review.py, which gives a model a shell in the pull request's
+checkout and posts what it finds. Its guarantees, in the README's "Security
+model": the review job's write token is held only by the poster, a process
+of another user started before sudo is removed, which checks, scrubs and
+signs every finding itself; the model never gets a GitHub token or the raw
+provider settings, and no step after the model is given one; egress is
+blocked; everything leaving the review job is scrubbed of the provider
+secrets, and `post` scrubs again on its own runner with the action's own
+engine.
 
 ## What a finding must show
 

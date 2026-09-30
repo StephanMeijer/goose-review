@@ -1,11 +1,12 @@
 name: Goose review - review
 description: >-
-  One lane's review: the caller's checks run with one model, a model of
-  another family verifies every finding, and the result is scrubbed and
-  uploaded for the `post` action. Runs in a job with a read-only token and
-  its network blocked but for what it needs (the caller's harden-runner step
-  comes first). The model gets a shell in the checkout; nothing later in
-  this job is trusted, which is why `post` runs in another job.
+  One lane's review: the caller's checks run with one model, which reports
+  each finding through the `post_comment` tool as it establishes it; a
+  model of another family verifies it then and there, and the poster (the
+  `poster` action, started before harden-runner) posts it. The model gets a
+  shell in the checkout and never the GitHub token: no step after it may be
+  given one. What was confirmed but not posted, the calls and the
+  transcripts are scrubbed and uploaded for the `post` action.
 author: Stephan Meijer
 
 inputs:
@@ -60,11 +61,14 @@ inputs:
     description: Checks run at once.
     default: "2"
   budget-minutes:
-    description: Wall-clock budget for all checks.
-    default: "35"
+    description: Wall-clock budget for all checks, verification included.
+    default: "45"
   verify-budget-minutes:
-    description: Wall-clock budget for verification.
-    default: "12"
+    description: >-
+      Deprecated: findings are verified during the review, within
+      budget-minutes. A value given is added to budget-minutes, with a
+      warning.
+    default: ""
   provider-routes:
     description: >-
       Secret. Lines `<template name>=<url>`: each renders that template for
@@ -77,7 +81,9 @@ inputs:
       process gets; a template's `api_key_env` names one.
     default: ""
   github-token:
-    description: Reads the pull request's answered findings; needs pull-requests read. Never reaches the model.
+    description: >-
+      Reads the pull request's answered findings (pull-requests read), in a
+      step before the model runs. Never reaches the model.
     default: ${{ github.token }}
   install-goose:
     description: Install Goose. `false` expects a `goose` on PATH (CI uses a fake one).
@@ -207,15 +213,20 @@ runs:
         --repo "$REPO" --pr "$PR" --out "$RUNNER_TEMP/answered.json"
         || echo "::warning::could not collect the answered findings; verifying without them"
 
-    - name: Review (${{ inputs.model }})
+    - name: Review (${{ inputs.model }}, verified by ${{ inputs.verify-model }})
       shell: bash
       env:
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
         BASE: ${{ github.event.pull_request.base.sha }}
         PROVIDER: ${{ inputs.provider }}
         MODEL: ${{ inputs.model }}
+        VERIFY_PROVIDER: ${{ inputs.verify-provider }}
+        VERIFY_MODEL: ${{ inputs.verify-model }}
+        BACKUP_PROVIDER: ${{ inputs.verify-backup-provider }}
+        BACKUP_MODEL: ${{ inputs.verify-backup-model }}
         JOBS: ${{ inputs.jobs }}
         BUDGET: ${{ inputs.budget-minutes }}
+        VERIFY_BUDGET: ${{ inputs.verify-budget-minutes }}
         CHECKS: ${{ inputs.checks }}
         CHECKS_DIR: ${{ inputs.checks-dir }}
         FACTS_DIR: ${{ inputs.facts-dir }}
@@ -225,37 +236,19 @@ runs:
         RULES_FILE: ${{ inputs.rules-file }}
       run: |
         source "$GITHUB_ACTION_PATH/../options.sh"
+        if [ -n "$VERIFY_BUDGET" ]; then
+          echo "::warning::verify-budget-minutes is deprecated: findings are verified during the review; its $VERIFY_BUDGET minutes are added to budget-minutes"
+          BUDGET=$(python3 -c 'import sys; print(float(sys.argv[1]) + float(sys.argv[2]))' "$BUDGET" "$VERIFY_BUDGET")
+        fi
+        # GOOSE_REVIEW_POSTER_SOCKET, set by the poster action, is where
+        # confirmed findings go; without it they wait for `post`.
         python3 "$GITHUB_ACTION_PATH/../goose_review.py" review \
           --base "$BASE" --provider "$PROVIDER" --model "$MODEL" \
-          --jobs "$JOBS" --budget-minutes "$BUDGET" --context "$RUNNER_TEMP/pr.md" \
-          "${options[@]}" "${checks[@]}" \
-          --out "$RUNNER_TEMP/review/findings.jsonl" --status "$RUNNER_TEMP/review/status.json"
-
-    - name: Verify (${{ inputs.verify-model }})
-      shell: bash
-      env:
-        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
-        BASE: ${{ github.event.pull_request.base.sha }}
-        PROVIDER: ${{ inputs.verify-provider }}
-        MODEL: ${{ inputs.verify-model }}
-        BACKUP_PROVIDER: ${{ inputs.verify-backup-provider }}
-        BACKUP_MODEL: ${{ inputs.verify-backup-model }}
-        BUDGET: ${{ inputs.verify-budget-minutes }}
-        CHECKS: ""
-        CHECKS_DIR: ${{ inputs.checks-dir }}
-        FACTS_DIR: ${{ inputs.facts-dir }}
-        IGNORE: ${{ inputs.ignore }}
-        TOOLS_FILE: ${{ inputs.tools-file }}
-        TOOLS: ${{ inputs.tools }}
-        RULES_FILE: ${{ inputs.rules-file }}
-      run: |
-        source "$GITHUB_ACTION_PATH/../options.sh"
-        python3 "$GITHUB_ACTION_PATH/../goose_review.py" verify \
-          --base "$BASE" --provider "$PROVIDER" --model "$MODEL" \
+          --verify-provider "$VERIFY_PROVIDER" --verify-model "$VERIFY_MODEL" \
           --backup-provider "$BACKUP_PROVIDER" --backup-model "$BACKUP_MODEL" \
-          --budget-minutes "$BUDGET" --context "$RUNNER_TEMP/pr.md" --answered "$RUNNER_TEMP/answered.json" \
-          "${options[@]}" \
-          --in "$RUNNER_TEMP/review/findings.jsonl" --out "$RUNNER_TEMP/review/verified.jsonl" \
+          --jobs "$JOBS" --budget-minutes "$BUDGET" --context "$RUNNER_TEMP/pr.md" --answered "$RUNNER_TEMP/answered.json" \
+          "${options[@]}" "${checks[@]}" \
+          --out "$RUNNER_TEMP/review/pending.jsonl" --calls "$RUNNER_TEMP/review/calls.jsonl" \
           --status "$RUNNER_TEMP/review/status.json"
 
     # The model could write to these directories through its shell, so
@@ -275,8 +268,8 @@ runs:
       with:
         name: goose-review-${{ inputs.lane }}
         path: |
-          ${{ runner.temp }}/review/findings.jsonl
-          ${{ runner.temp }}/review/verified.jsonl
+          ${{ runner.temp }}/review/pending.jsonl
+          ${{ runner.temp }}/review/calls.jsonl
           ${{ runner.temp }}/review/status.json
           ${{ runner.temp }}/goose-logs/*.log
         if-no-files-found: ignore
