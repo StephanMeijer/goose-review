@@ -162,7 +162,7 @@ jobs:
             ${{ inputs.providers-dir }}
           persist-credentials: false
       - id: lanes
-        uses: StephanMeijer/goose-review/lanes@56076072389fed14eb0cbcb288c0b8038c330ace
+        uses: StephanMeijer/goose-review/lanes@0c275f29fb75cb06466c90856b46e19390df1071
         with:
           lanes: ${{ inputs.lanes }}
           checks-dir: ${{ inputs.checks-dir }}
@@ -172,7 +172,7 @@ jobs:
           verify-model: ${{ inputs.verify-model }}
           verify-backup-provider: ${{ inputs.verify-backup-provider }}
           verify-backup-model: ${{ inputs.verify-backup-model }}
-      - uses: StephanMeijer/goose-review/tidy@56076072389fed14eb0cbcb288c0b8038c330ace
+      - uses: StephanMeijer/goose-review/tidy@0c275f29fb75cb06466c90856b46e19390df1071
 
   # One job per lane, where its models have a shell: a read-only token and
   # the network blocked but for GitHub, the providers and what the caller's
@@ -247,7 +247,7 @@ jobs:
       # The caller's tools, pinned by sha256, before its setup (which may
       # use them) and before any secret or model.
       - if: inputs.tools != ''
-        uses: StephanMeijer/goose-review/tools@56076072389fed14eb0cbcb288c0b8038c330ace
+        uses: StephanMeijer/goose-review/tools@0c275f29fb75cb06466c90856b46e19390df1071
         with:
           tools: ${{ inputs.tools }}
 
@@ -259,7 +259,7 @@ jobs:
           SETUP: ${{ inputs.setup }}
         run: bash -euo pipefail -c "$SETUP"
 
-      - uses: StephanMeijer/goose-review/review@56076072389fed14eb0cbcb288c0b8038c330ace
+      - uses: StephanMeijer/goose-review/review@0c275f29fb75cb06466c90856b46e19390df1071
         with:
           lanes: ${{ format('[{0}]', toJSON(matrix)) }}
           artifact: goose-review-${{ matrix.lane }}
@@ -341,7 +341,7 @@ jobs:
       # The caller's tools, pinned by sha256, before its setup (which may
       # use them) and before any secret or model.
       - if: inputs.tools != ''
-        uses: StephanMeijer/goose-review/tools@56076072389fed14eb0cbcb288c0b8038c330ace
+        uses: StephanMeijer/goose-review/tools@0c275f29fb75cb06466c90856b46e19390df1071
         with:
           tools: ${{ inputs.tools }}
 
@@ -353,7 +353,7 @@ jobs:
           SETUP: ${{ inputs.setup }}
         run: bash -euo pipefail -c "$SETUP"
 
-      - uses: StephanMeijer/goose-review/verify@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/verify@0c275f29fb75cb06466c90856b46e19390df1071
         with:
           lanes: ${{ needs.plan.outputs.lanes }}
           verify-provider: ${{ inputs.verify-provider }}
@@ -415,7 +415,7 @@ jobs:
             productionresultssa17.blob.core.windows.net:443
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
-      - uses: StephanMeijer/goose-review/post@56076072389fed14eb0cbcb288c0b8038c330ace
+      - uses: StephanMeijer/goose-review/post@0c275f29fb75cb06466c90856b46e19390df1071
         with:
           lanes: ${{ needs.plan.outputs.lanes }}
           verify-model: ${{ inputs.verify-model }}
