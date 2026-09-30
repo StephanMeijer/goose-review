@@ -44,7 +44,7 @@ jobs:
          {"lane": "mistral", "provider": "thirdparty", "model": "mistral-medium-3-5",
           "verify-provider": "minimax", "verify-model": "MiniMax-M3",
           "verify-backup-provider": "thirdparty", "verify-backup-model": "deepseek-v4-flash-0731"}]
-      egress-endpoints: ${{ vars.GOOSE_PROXY_EGRESS }}
+      egress-endpoints: '["${{ vars.GOOSE_PROXY_EGRESS }}"]'
       ignore: |
         CHANGELOG.md
         docs/plan.md

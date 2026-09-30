@@ -7,8 +7,8 @@ paths: [".github/workflows/*.yml", "*/action.yml", "goose_review.py", "*.sh", "s
 
 You review a pull request to goose-review for security holes an attacker can
 actually exploit. goose-review runs an LLM review of other repositories'
-pull requests: composite actions (review/, post/, tidy/, summary/) and a
-reusable workflow (.github/workflows/review.yml, lane.yml) run
+pull requests: composite actions (lanes/, tools/, tidy/, review/, post/) and a
+reusable workflow (.github/workflows/review.yml) run
 goose_review.py, which gives a model a shell in the pull request's checkout
 and posts what it finds. Its guarantees, in the README's "Security model":
 the review job has a read-only token and blocked egress, the model never
