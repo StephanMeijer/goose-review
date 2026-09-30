@@ -1,9 +1,12 @@
 name: Goose review - post
 description: >-
-  Publishes one lane's verified findings on the pull request, in a job of
-  its own that runs no model. The review job's artifact is scrubbed again
-  here first: once the model had a shell in the review job, nothing later
-  in that job can be trusted, and this job runs on a fresh runner with the
+  Finishes one lane, in a job of its own that runs no model: posts what the
+  review confirmed but its poster never got (it did not start, or could not
+  be reached), counts what the lane posted -- read back from the pull
+  request, not taken from the review job's word -- and writes the lane's
+  result for the summary. The review job's artifact is scrubbed again here
+  first: once the model had a shell in the review job, nothing later in
+  that job can be trusted, and this job runs on a fresh runner with the
   action's own copy of the script.
 author: Stephan Meijer
 
@@ -24,7 +27,7 @@ inputs:
     description: Secret. The same value as the review action's; only redacted here.
     default: ""
   github-token:
-    description: Posts the review and replies; needs pull-requests write.
+    description: Posts what is left and reads what the lane posted; needs pull-requests write.
     default: ${{ github.token }}
 
 runs:
@@ -53,7 +56,7 @@ runs:
         GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
       run: python3 "$GITHUB_ACTION_PATH/../goose_review.py" scrub "$RUNNER_TEMP/artifact"
 
-    - name: Post the review
+    - name: Finish the lane
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -68,7 +71,7 @@ runs:
         python3 "$GITHUB_ACTION_PATH/../goose_review.py" post
         --repo "$REPO" --pr "$PR" --head-sha "$HEAD_SHA" --base-sha "$BASE_SHA"
         --lane "$LANE" --model "$MODEL" --verify-model "$VERIFY_MODEL"
-        --in "$RUNNER_TEMP/artifact/review/verified.jsonl"
+        --in "$RUNNER_TEMP/artifact/review/pending.jsonl"
         --status "$RUNNER_TEMP/artifact/review/status.json"
         --result "$RUNNER_TEMP/result/$LANE.json"
 

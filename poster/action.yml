@@ -1,0 +1,118 @@
+name: Goose review - poster
+description: >-
+  Starts the lane's poster: the process that posts each finding on the pull
+  request as soon as a second model confirms it. It runs as a user of its
+  own, with the GitHub token and the provider settings (to scrub with) in
+  its memory only, so the model's shell -- the runner user, without sudo --
+  cannot read them. Must come before harden-runner, while sudo still
+  exists; the review action finds it through GOOSE_REVIEW_POSTER_SOCKET.
+  It also checks out the pull request, so no later step needs the token.
+  Should it not start, the review still runs and `post` posts its findings
+  at the end.
+author: Stephan Meijer
+
+inputs:
+  lane:
+    description: The lane's name, as given to the review action.
+    required: true
+  model:
+    description: The reviewing model, for the signature.
+    required: true
+  verify-model:
+    description: The verifying model; only findings it (or the backup) confirmed are posted.
+    required: true
+  verify-backup-model:
+    description: The backup verifier's model, if the lane has one.
+    default: ""
+  provider-routes:
+    description: Secret. The same value as the review action's; only used to scrub what is posted.
+    default: ""
+  provider-env:
+    description: Secret. The same value as the review action's; only used to scrub what is posted.
+    default: ""
+  github-token:
+    description: Posts the findings; needs pull-requests write. Reaches only the poster.
+    default: ${{ github.token }}
+  checkout:
+    description: >-
+      Also check out the pull request's head (with its history and the
+      base commit) into the workspace. A plain fetch rather than
+      actions/checkout, whose post step would be given the token after the
+      model has run -- and the model can rewrite what later steps run.
+      With `false`, check it out yourself without handing any later step a
+      token.
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Start the poster
+      shell: bash
+      env:
+        LANE: ${{ inputs.lane }}
+        MODEL: ${{ inputs.model }}
+        VERIFY_MODEL: ${{ inputs.verify-model }}
+        BACKUP_MODEL: ${{ inputs.verify-backup-model }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        GOOSE_REVIEW_PROVIDER_ROUTES: ${{ inputs.provider-routes }}
+        GOOSE_REVIEW_PROVIDER_ENV: ${{ inputs.provider-env }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        python3 "$GITHUB_ACTION_PATH/../goose_review.py" mask
+        if ! sudo -n true 2>/dev/null; then
+          echo "::error::the poster needs sudo: put this step before harden-runner (which removes it)" >&2
+          exit 1
+        fi
+        # No process may attach to another's memory without CAP_SYS_PTRACE,
+        # which the runner user does not have once sudo is gone: the model
+        # cannot read the token out of the runner's or the poster's memory.
+        sudo sysctl -q -w kernel.yama.ptrace_scope=2
+        user=goose-review-poster
+        sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$user"
+        # The engine the poster runs, where the runner user cannot change it.
+        sudo install -d -o root -g root -m 0755 /opt/goose-review
+        sudo install -o root -g root -m 0644 "$GITHUB_ACTION_PATH/../goose_review.py" /opt/goose-review/goose_review.py
+        sudo install -d -o "$user" -g "$user" -m 0755 /run/goose-review /var/lib/goose-review
+        socket=/run/goose-review/poster.sock
+        verifiers=(--verifier "$VERIFY_MODEL")
+        if [ -n "$BACKUP_MODEL" ]; then verifiers+=(--verifier "$BACKUP_MODEL"); fi
+        # The secrets go in on stdin, never on a command line or in a file;
+        # sudo starts the poster with an environment of its own.
+        jq -cn --arg token "$GH_TOKEN" --arg routes "$GOOSE_REVIEW_PROVIDER_ROUTES" --arg env "$GOOSE_REVIEW_PROVIDER_ENV" \
+            '{token: $token, routes: $routes, env: $env, secrets: ""}' \
+          | sudo -u "$user" -- setsid "$(command -v python3)" /opt/goose-review/goose_review.py poster \
+              --socket "$socket" --repo "$REPO" --pr "$PR" --head-sha "$HEAD_SHA" --base-sha "$BASE_SHA" \
+              --lane "$LANE" --model "$MODEL" "${verifiers[@]}" --log /var/lib/goose-review/posted.jsonl \
+              >/dev/null 2>&1 &
+        for _ in $(seq 100); do
+          [ -S "$socket" ] && break
+          sleep 0.2
+        done
+        if [ -S "$socket" ]; then
+          echo "GOOSE_REVIEW_POSTER_SOCKET=$socket" >> "$GITHUB_ENV"
+          echo "poster: listening for lane $LANE"
+        else
+          echo "::warning::the poster did not start; the lane's findings are posted when its review ends"
+        fi
+
+    # The PR head itself, not the merge commit: review comments are
+    # anchored to the head's line numbers.
+    - name: Check out the pull request
+      if: inputs.checkout == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        SERVER: ${{ github.server_url }}
+        REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        git init -q .
+        git remote add origin "$SERVER/$REPO"
+        auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+        echo "::add-mask::$auth"
+        git -c "http.extraheader=AUTHORIZATION: basic $auth" fetch -q --no-tags origin "$HEAD_SHA" "$BASE_SHA"
+        git checkout -q --detach "$HEAD_SHA"

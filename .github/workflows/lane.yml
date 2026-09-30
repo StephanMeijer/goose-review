@@ -1,14 +1,19 @@
 # One lane of the pre-composed Goose review (review.yml calls it once per
-# lane): a `review` job, where the model has a shell, and a `post` job that
-# runs no model and alone may write to the pull request.
+# lane): a `review` job, where the model has a shell and each finding is
+# posted as soon as a second model confirms it, and a `post` job that runs
+# no model and finishes the lane.
 #
-# The split is the point. The review job holds a read-only token and its
-# network is limited to GitHub, the providers and what the caller's tools
-# and setup need, without sudo to lift that limit. What it writes is scrubbed of the
-# provider settings; once the model has had a shell there, nothing later in
-# that job is trusted, so `post` scrubs again on its own runner before
-# publishing anything. The job names `review` and `post` are what the
-# summary links a lane's row to.
+# The review job's token can write to the pull request, and the model must
+# never get it. Only the poster holds it: started first, while sudo still
+# exists, as a user of its own, with the token in its memory only; the
+# model reaches it through a socket and gets back only "posted" or why not.
+# Then harden-runner limits the network to GitHub, the providers and what
+# the caller's tools and setup need, and removes sudo. No step after the
+# model is given the token (harden-runner gets none, and the checkout is a
+# plain fetch in the poster action): the model can rewrite what later steps
+# run. What the job uploads is scrubbed of the provider settings, and
+# `post` scrubs again on its own runner. The job names `review` and `post`
+# are what the summary links a lane's row to.
 name: Goose review lane
 
 on:
@@ -30,8 +35,9 @@ on:
       tools-file: { type: string, default: "" }
       tools: { type: string, default: "" }
       rules-file: { type: string, default: "" }
-      budget-minutes: { type: number, default: 35 }
-      verify-budget-minutes: { type: number, default: 12 }
+      budget-minutes: { type: number, default: 45 }
+      # Deprecated: added to budget-minutes.
+      verify-budget-minutes: { type: number, default: 0 }
       egress-endpoints: { type: string, default: "[]" }
       setup: { type: string, default: "" }
       runs-on: { type: string, default: ubuntu-latest }
@@ -49,17 +55,30 @@ jobs:
   review:
     name: review
     runs-on: ${{ inputs.runs-on }}
-    # Bounded by time, not turns: the checks share budget-minutes and
-    # verification gets verify-budget-minutes.
+    # Bounded by time, not turns: the checks, and the verification of what
+    # they post, share budget-minutes.
     timeout-minutes: ${{ inputs.review-timeout-minutes }}
     # Advisory: a lane that fails must not fail the pull request; `post`
     # says on it that the review did not run.
     continue-on-error: true
     permissions:
       contents: read
-      # Read-only, for the answered findings; only that step holds the token.
-      pull-requests: read
+      # The poster posts the findings; the answered findings are read in a
+      # step before the model runs. The model never holds the token.
+      pull-requests: write
     steps:
+      # First, while sudo still exists: see the header. It also checks out
+      # the pull request's head (a fetch: actions/checkout's post step would
+      # get the token after the model has run).
+      - uses: StephanMeijer/goose-review/poster@1e7c82b2888c383ec16ccfb4fd651dec6777523a
+        with:
+          lane: ${{ inputs.lane }}
+          model: ${{ inputs.model }}
+          verify-model: ${{ inputs.verify-model }}
+          verify-backup-model: ${{ inputs.verify-backup-model }}
+          provider-routes: ${{ secrets.PROVIDER_ROUTES }}
+          provider-env: ${{ secrets.PROVIDER_ENV }}
+
       # Everything after this step can reach only the endpoints listed; the
       # agent splits the list on single spaces, so the caller's entries are
       # joined with exactly that. The
@@ -68,6 +87,8 @@ jobs:
       # not *.blob.core.windows.net, where anyone can create an account.
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
+          # Its post step runs after the model: it gets no token.
+          token: ""
           egress-policy: block
           disable-sudo-and-containers: true
           allowed-endpoints: >
@@ -98,18 +119,11 @@ jobs:
             productionresultssa19.blob.core.windows.net:443
             ${{ join(fromJSON(inputs.egress-endpoints), ' ') }}
 
-      # The PR head itself, not the merge commit: review comments are
-      # anchored to the head's line numbers.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          persist-credentials: false
 
       # The caller's tools, pinned by sha256, before its setup (which may
       # use them) and before any secret or model.
       - if: inputs.tools != ''
-        uses: StephanMeijer/goose-review/tools@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+        uses: StephanMeijer/goose-review/tools@1e7c82b2888c383ec16ccfb4fd651dec6777523a
         with:
           tools: ${{ inputs.tools }}
 
@@ -121,7 +135,7 @@ jobs:
           SETUP: ${{ inputs.setup }}
         run: bash -euo pipefail -c "$SETUP"
 
-      - uses: StephanMeijer/goose-review/review@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/review@1e7c82b2888c383ec16ccfb4fd651dec6777523a
         with:
           lane: ${{ inputs.lane }}
           provider: ${{ inputs.provider }}
@@ -140,7 +154,7 @@ jobs:
           tools: ${{ inputs.tools }}
           rules-file: ${{ inputs.rules-file }}
           budget-minutes: ${{ inputs.budget-minutes }}
-          verify-budget-minutes: ${{ inputs.verify-budget-minutes }}
+          verify-budget-minutes: ${{ inputs.verify-budget-minutes > 0 && inputs.verify-budget-minutes || '' }}
           provider-routes: ${{ secrets.PROVIDER_ROUTES }}
           provider-env: ${{ secrets.PROVIDER_ENV }}
           install-goose: ${{ inputs.install-goose }}
@@ -185,7 +199,7 @@ jobs:
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
 
-      - uses: StephanMeijer/goose-review/post@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/post@1e7c82b2888c383ec16ccfb4fd651dec6777523a
         with:
           lane: ${{ inputs.lane }}
           model: ${{ inputs.model }}

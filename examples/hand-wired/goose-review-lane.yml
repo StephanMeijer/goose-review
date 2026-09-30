@@ -1,6 +1,12 @@
-# One lane: `review` (the model has a shell; read-only token, network
-# blocked but for GitHub and your providers) and `post` (no model; alone
-# may write to the pull request, and scrubs again before it does).
+# One lane: `review` (the model has a shell, the network blocked but for
+# GitHub and your providers; each finding is posted as soon as a second
+# model confirms it, by the poster, which alone holds the token) and `post`
+# (no model; posts what the poster did not get, and scrubs again first).
+#
+# In the review job, the poster comes first (it needs sudo, which
+# harden-runner then removes) and also checks out the pull request; no step
+# after the model may be given the token -- hence harden-runner's empty
+# `token`, and no actions/checkout, whose post step would get it.
 name: Goose review lane
 
 on:
@@ -23,10 +29,20 @@ jobs:
     continue-on-error: true
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     steps:
+      - uses: StephanMeijer/goose-review/poster@583a38a2ee99a7f01f76f39a81b9cd84076fadee # v0.3.2
+        with:
+          lane: ${{ inputs.lane }}
+          model: ${{ inputs.model }}
+          verify-model: ${{ inputs.verify-model }}
+          verify-backup-model: ${{ inputs.verify-backup-model }}
+          provider-routes: ${{ secrets.GOOSE_REVIEW_ROUTES }}
+          provider-env: ${{ secrets.GOOSE_REVIEW_PROVIDER_ENV }}
+
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
+          token: ""
           egress-policy: block
           disable-sudo-and-containers: true
           allowed-endpoints: >
@@ -56,12 +72,6 @@ jobs:
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
             llm-proxy.example.com:443
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          persist-credentials: false
 
       # Your own preparation here, before any secret or model runs.
 

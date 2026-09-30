@@ -4,8 +4,10 @@
 It answers the way the engine reads Goose: a JSON document with the run's
 `metadata.status` and the assistant's messages.
 
-- A review prompt (it has a `## Diff`) gets one finding on every added line
-  that contains GOOSE-REVIEW-E2E, severity medium.
+- A review prompt (it has a `## Diff`) posts one finding on every added line
+  that contains GOOSE-REVIEW-E2E, severity medium, through the
+  `post_comment` tool of the `--with-extension` server (it speaks MCP to
+  it the way Goose 1.52 does), then answers {"done": true}.
 - A verify prompt (it has `## Findings`) gets every finding kept, with the
   line it names quoted from the checkout as evidence.
 - A model named in FAKE_GOOSE_EMPTY_MODELS (space-separated) answers every
@@ -20,6 +22,8 @@ It answers the way the engine reads Goose: a JSON document with the run's
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -34,7 +38,7 @@ def answer(text: str, tokens: int = 1000) -> None:
     }))
 
 
-def review(prompt: str) -> str:
+def planted(prompt: str) -> list[dict]:
     diff = prompt.split("## Diff", 1)[1]
     findings, path, line = [], None, 0
     for row in diff.splitlines():
@@ -51,7 +55,35 @@ def review(prompt: str) -> str:
             line += 1
         elif not row.startswith("-"):
             line += 1
-    return json.dumps({"findings": findings})
+    return findings
+
+
+def review(prompt: str, extension: str) -> str:
+    """Post each planted finding through the extension's post_comment tool."""
+    name, _, command = extension.partition(":")
+    server = subprocess.Popen(shlex.split(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+    def ask(n: int, method: str, params: dict | None = None) -> dict:
+        server.stdin.write(json.dumps({"jsonrpc": "2.0", "id": n, "method": method, "params": params or {}}) + "\n")
+        server.stdin.flush()
+        while True:
+            message = json.loads(server.stdout.readline())
+            if message.get("id") == n:
+                return message
+
+    ask(0, "server/discover")
+    ask(1, "initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "fake-goose"}})
+    server.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    tools = [t["name"] for t in ask(2, "tools/list")["result"]["tools"]]
+    assert tools == ["post_comment"], tools
+    answers = []
+    for n, finding in enumerate(planted(prompt), 3):
+        result = ask(n, "tools/call", {"name": "post_comment", "arguments": finding})["result"]
+        answers.append(result["content"][0]["text"])
+    server.stdin.close()
+    server.wait(timeout=30)
+    print("\n".join(answers), file=sys.stderr)
+    return json.dumps({"done": True})
 
 
 def verify(prompt: str) -> str:
@@ -92,7 +124,8 @@ def main() -> None:
         return
     if "## Diff" in prompt and model in os.environ.get("FAKE_GOOSE_SLOW_MODELS", "").split():
         time.sleep(float(os.environ.get("FAKE_GOOSE_SLOW_SECONDS", "90")))
-    text = verify(prompt) if "## Findings" in prompt else review(prompt) if "## Diff" in prompt else ""
+    extension = args[args.index("--with-extension") + 1] if "--with-extension" in args else ""
+    text = verify(prompt) if "## Findings" in prompt else review(prompt, extension) if "## Diff" in prompt else ""
     session.write_text(text, encoding="utf-8")
     answer(text)
 

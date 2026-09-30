@@ -1,6 +1,8 @@
-"""The engine end to end with tests/fake-goose, no network: review finds the
-planted line, verify keeps it with evidence, and a verifier that answers
-empty hands over to the backup. Run: python3 -m unittest discover -s tests"""
+"""The engine end to end with tests/fake-goose, no network: the review posts
+the planted line through post_comment, the verifier confirms it with
+evidence, a verifier that answers empty hands over to the backup, and with
+no poster the confirmed finding waits in pending.jsonl for `post`.
+Run: python3 -m unittest discover -s tests"""
 
 import json
 import os
@@ -55,38 +57,36 @@ class Engine(unittest.TestCase):
     def status(self) -> dict:
         return json.loads((self.repo / "out" / "status.json").read_text())
 
-    def review(self) -> None:
+    def review(self, *extra: str, **env: str) -> None:
         self.engine("review", "--base", "HEAD~1", "--provider", "p", "--model", "reviewer",
-                    "--ignore", "gen/**", "--out", "out/findings.jsonl", "--status", "out/status.json")
-
-    def verify(self, **env: str) -> None:
-        self.engine("verify", "--base", "HEAD~1", "--provider", "p", "--model", "verifier",
+                    "--verify-provider", "p", "--verify-model", "verifier",
                     "--backup-provider", "p", "--backup-model", "backup", "--ignore", "gen/**",
-                    "--in", "out/findings.jsonl", "--out", "out/verified.jsonl", "--status", "out/status.json", **env)
+                    "--out", "out/pending.jsonl", "--status", "out/status.json", *extra, **env)
 
-    def test_review_then_verify(self) -> None:
+    def test_a_finding_is_verified_as_it_is_posted(self) -> None:
         self.review()
-        findings = self.read("findings.jsonl")
-        self.assertEqual([(f["path"], f["line_start"], f["check"]) for f in findings], [("src/a.py", 2, "planted")])
-        self.assertEqual(self.status()["checks_run"], ["planted"])
-        self.assertEqual(self.status()["checks_skipped"], ["other"])
-        self.verify()
-        verified = self.read("verified.jsonl")
-        self.assertEqual(len(verified), 1)
-        self.assertEqual(verified[0]["evidence"], {"path": "src/a.py", "line": 2})
-        self.assertNotEqual(verified[0].get("verified_by"), "backup")
+        pending = self.read("pending.jsonl")
+        self.assertEqual([(f["path"], f["line_start"], f["check"]) for f in pending], [("src/a.py", 2, "planted")])
+        self.assertEqual(pending[0]["evidence"], {"path": "src/a.py", "line": 2})
+        self.assertEqual(pending[0]["verified_by"], "verifier")
+        self.assertEqual([c["outcome"] for c in self.read("calls.jsonl")], ["pending"])
+        status = self.status()
+        self.assertEqual(status["checks_run"], ["planted"])
+        self.assertEqual(status["checks_skipped"], ["other"])
+        self.assertEqual(status["checks_failed"], [])
+        self.assertEqual((status["found"], status["pending"], status["rejected"]), (1, 1, 0))
+        self.assertEqual(status["verified_by"], ["verifier"])
 
     def test_the_backup_verifies_when_the_verifier_answers_empty(self) -> None:
-        self.review()
-        self.verify(FAKE_GOOSE_EMPTY_MODELS="verifier")
-        self.assertEqual([f.get("verified_by") for f in self.read("verified.jsonl")], ["backup"])
+        self.review(FAKE_GOOSE_EMPTY_MODELS="verifier")
+        self.assertEqual([f.get("verified_by") for f in self.read("pending.jsonl")], ["backup"])
         self.assertEqual(self.status()["verified_by"], ["backup"])
 
     def test_only_the_named_checks_run(self) -> None:
-        self.engine("review", "--base", "HEAD~1", "--provider", "p", "--model", "reviewer", "--check", "other",
-                    "--out", "out/findings.jsonl", "--status", "out/status.json")
-        self.assertEqual(self.read("findings.jsonl"), [])
+        self.review("--check", "other")
+        self.assertEqual(self.read("pending.jsonl"), [])
         self.assertEqual(self.status()["checks_run"], [])
+        self.assertEqual(self.status()["found"], 0)
 
 
 if __name__ == "__main__":

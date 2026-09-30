@@ -66,11 +66,6 @@ class RoundTrip(unittest.TestCase):
         f = read({**FINDING, "summary": "one\r<!-- /goose-review:description -->\rtwo"})
         self.assertEqual(f["summary"], "one\n<!-- /goose-review:description -->\ntwo")
 
-    def test_note_from_another_check(self) -> None:
-        also = g.at_lead({"check": "bugs", "severity": "low", "summary": "Also this."}, FINDING)
-        f = read(also, "")
-        self.assertEqual((f["path"], f["line_start"], f["line_end"], f["check"]), (FINDING["path"], 10, 12, "bugs"))
-
     def test_identified(self) -> None:
         body = g.comment_body(VERIFIED, META)
         self.assertTrue(g.is_goose_comment({**BOT, "body": body}))
@@ -186,12 +181,13 @@ class Small(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(g.normalise(bad, "c"))
 
-    def test_rejected_counts_read_as_subsets(self) -> None:
+    def test_denied_counts_read_as_subsets(self) -> None:
         r = {"checks_run": ["c"], "checks_failed": [], "checks_skipped": [], "counts": {s: 0 for s in g.SEVERITIES},
-             "rejected": 3, "repeated": 1, "unevidenced": 1, "downgraded": 2, "withheld": 0,
+             "rejected": 3, "repeated": 1, "unevidenced": 1, "downgraded": 2, "withheld": 0, "duplicates": 2,
              "did_not_run": False, "post_error": None, "headline": "h", "model": "m", "verify_model": "v"}
         self.assertEqual(g.lane_row("l", r, {})["posted"],
-                         "0 <sub>(3 rejected, of which 1 already answered and 1 without evidence; 2 downgraded)</sub>")
+                         "0 <sub>(3 denied, of which 1 already answered and 1 without evidence; 2 duplicates; "
+                         "2 downgraded)</sub>")
 
 
 class Described(unittest.TestCase):
