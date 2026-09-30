@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- This repository's own review follows the approach from #6: one short
+  `general` check covers the whole diff, investigates only concrete
+  suspicions and treats its budget as a ceiling. A shorter `security` check
+  supplements it. The `correctness` check is gone, since `general` covers
+  it. The README's new "Writing checks" section explains the approach for
+  callers.
+- A fourth lane for this repository's own review: `free`, the llm2 proxy's
+  free pool, verified by MiniMax-M3.
+
 ## 0.4.0
 
 - `tools`: install your own tools in the review job and tell the model it

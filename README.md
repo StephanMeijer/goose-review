@@ -210,6 +210,30 @@ The engine adds the rest of the prompt:
 Facts use the same format. See [`examples/checks/`](examples/checks/) and
 [`examples/facts/`](examples/facts/).
 
+### Writing checks
+
+A trial on planted bugs ([#6](https://github.com/StephanMeijer/goose-review/issues/6))
+found that a short, broad prompt found the same real bugs as a detailed one,
+in about half the time. More instructions made the model read more files,
+but it found no more bugs. So:
+
+- **One broad check covers everything.** Give it `paths: []`, keep its prompt
+  short, and have it cover the whole diff before going deep anywhere. Don't
+  hand it a checklist of files to read.
+- **Investigate concrete suspicions only.** Read the callers, guards, tests
+  or base version that settle a claim, then stop. No findings is a valid
+  answer.
+- **The budget is a ceiling.** A longer review is not a better one.
+- **Specialist checks supplement the broad one.** A check limited to one
+  concern (security, say) leaves out everything else, by design. It never
+  replaces the broad check.
+- **The verifier confirms.** Checks do not need to prove every finding at
+  length: every finding still goes to the lane's verifier, which confirms
+  the trigger, the impact and the evidence before anything is posted.
+
+This repository's own [`.agents/checks/`](.agents/checks/) follows this
+approach: `general` (broad) and `security` (a specialist).
+
 ## Providers
 
 Two kinds of Goose provider template ([`examples/providers/`](examples/providers/)):
@@ -287,7 +311,15 @@ Set `GOOSE_REVIEW_LOG_DIR` to keep every run's full transcript.
 - `goose-review.yml` reviews this repository's own pull requests with real
   models through its own `review.yml`, once the proxy secrets and the
   variable `GOOSE_REVIEW_ENABLED=true` are set. The fake-Goose e2e then runs
-  on the fixture branches only.
+  on the fixture branches only. Its lanes are DeepSeek V4 Flash, MiniMax-M3,
+  Mistral Medium and `free`, the proxy's free pool
+  ([`free.json`](.github/goose/providers/free.json), routed by the
+  repository variable `GOOSE_FREE_BASE_URL`, with the same
+  `GOOSE_PROXY_TOKEN`). The free pool sends
+  each request to whichever free upstream model is available, so that
+  lane's reviewer can vary from run to run. When the pool is exhausted, the
+  lane fails with an availability error instead of switching to a paid
+  model.
 - After changing the actions or the engine, commit, then run
   `scripts/pin.sh` and commit the pin.
 - To release: `scripts/release.sh X.Y.Z`.
