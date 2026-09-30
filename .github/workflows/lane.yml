@@ -70,7 +70,7 @@ jobs:
       # First, while sudo still exists: see the header. It also checks out
       # the pull request's head (a fetch: actions/checkout's post step would
       # get the token after the model has run).
-      - uses: StephanMeijer/goose-review/poster@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/poster@1e7c82b2888c383ec16ccfb4fd651dec6777523a
         with:
           lane: ${{ inputs.lane }}
           model: ${{ inputs.model }}
@@ -123,7 +123,7 @@ jobs:
       # The caller's tools, pinned by sha256, before its setup (which may
       # use them) and before any secret or model.
       - if: inputs.tools != ''
-        uses: StephanMeijer/goose-review/tools@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+        uses: StephanMeijer/goose-review/tools@1e7c82b2888c383ec16ccfb4fd651dec6777523a
         with:
           tools: ${{ inputs.tools }}
 
@@ -135,7 +135,7 @@ jobs:
           SETUP: ${{ inputs.setup }}
         run: bash -euo pipefail -c "$SETUP"
 
-      - uses: StephanMeijer/goose-review/review@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/review@1e7c82b2888c383ec16ccfb4fd651dec6777523a
         with:
           lane: ${{ inputs.lane }}
           provider: ${{ inputs.provider }}
@@ -199,7 +199,7 @@ jobs:
             productionresultssa18.blob.core.windows.net:443
             productionresultssa19.blob.core.windows.net:443
 
-      - uses: StephanMeijer/goose-review/post@54f2bd9c019e42a84d643dd59bf1fccc376aac70
+      - uses: StephanMeijer/goose-review/post@1e7c82b2888c383ec16ccfb4fd651dec6777523a
         with:
           lane: ${{ inputs.lane }}
           model: ${{ inputs.model }}
