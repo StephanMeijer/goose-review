@@ -35,15 +35,15 @@ jobs:
       pull-requests: write
     with:
       lanes: >-
-        [{"lane": "deepseek", "provider": "thirdparty", "model": "deepseek-v4-flash-0731",
-          "verify-provider": "minimax", "verify-model": "MiniMax-M3",
-          "verify-backup-provider": "thirdparty", "verify-backup-model": "deepseek-v4-flash-0731"},
-         {"lane": "minimax", "provider": "minimax", "model": "MiniMax-M3",
-          "verify-provider": "thirdparty", "verify-model": "deepseek-v4-flash-0731",
-          "verify-backup-provider": "minimax", "verify-backup-model": "MiniMax-M3", "jobs": 3},
-         {"lane": "mistral", "provider": "thirdparty", "model": "mistral-medium-3-5",
-          "verify-provider": "minimax", "verify-model": "MiniMax-M3",
-          "verify-backup-provider": "thirdparty", "verify-backup-model": "deepseek-v4-flash-0731"}]
+        [{"lane": "deepseek", "provider": "thirdparty", "model": "deepseek-v4-flash-0731"},
+         {"lane": "minimax", "provider": "minimax", "model": "MiniMax-M3", "jobs": 3},
+         {"lane": "mistral", "provider": "thirdparty", "model": "mistral-medium-3-5"}]
+      # One verifier for every lane's findings; it also verifies its own
+      # family's lane (minimax).
+      verify-provider: minimax
+      verify-model: MiniMax-M3
+      verify-backup-provider: thirdparty
+      verify-backup-model: deepseek-v4-flash-0731
       egress-endpoints: '["${{ vars.GOOSE_PROXY_EGRESS }}"]'
       ignore: |
         CHANGELOG.md
